@@ -1,0 +1,12 @@
+This is the notary server for the TLSNotary protocol.
+
+It is primarily intended to be run inside a sandboxed AWS EC2 instance (https://github.com/tlsnotary/pagesigner-oracles). It can also be run as a regular server (you'll have to start it with --no-sandbox and pass the file public.key to the client).
+
+To compile:
+
+go mod init notary
+go get github.com/bwesterb/go-ristretto@b51b4774df9150ea7d7616f76e77f745a464bbe3
+go get github.com/roasbeef/go-go-gadget-paillier@14f1f86b60008ece97b6233ed246373e555fc79f
+go get golang.org/x/crypto/blake2b
+go get golang.org/x/crypto/nacl/secretbox
+go build -o notary
