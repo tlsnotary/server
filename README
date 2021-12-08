@@ -2,6 +2,9 @@ This is the notary server for the TLSNotary protocol.
 
 It is primarily intended to be run inside a sandboxed AWS EC2 instance (https://github.com/tlsnotary/pagesigner-oracles). It can also be run as a regular server (you'll have to start it with --no-sandbox and pass the file public.key to the client).
 
+Clone this repo with:
+git clone --recurse-submodules https://github.com/tlsnotary/server
+
 To compile:
 
 go mod init notary
