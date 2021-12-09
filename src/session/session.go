@@ -111,8 +111,8 @@ func (s *Session) sequenceCheck(seqNo int) {
 		}
 	}
 	if !u.Contains(seqNo-1, s.msgsSeen) {
-		if seqNo == 1 || (seqNo == 36 && u.Contains(33, s.msgsSeen)) {
-			// steps 34 and 35 are optional and can be skipped
+		if seqNo == 1 || (seqNo == 36 && u.Contains(32, s.msgsSeen)) {
+			// steps 33,34 and 35 are optional and can be skipped
 		} else {
 			panic("previous message not seen")
 		}
@@ -982,7 +982,17 @@ func (s *Session) CheckC6Commit(encrypted []byte) []byte {
 func (s *Session) Ghash_step1(encrypted []byte) []byte {
 	s.sequenceCheck(32)
 	body := s.decryptFromClient(encrypted)
+
 	g := s.g
+	s.ghashOutputShare = u.XorBytes(s.ghashOutputShare, g.Cs[6].Masks[1])
+
+	if len(body) == 2 {
+		// The Client's max odd power needed is 3, he doesn't need any OT
+		s.maxPowerNeeded = int(binary.BigEndian.Uint16(body))
+		//perform free squaring on powers 2,3 which we have from client finished
+		u.FreeSquare(&s.powersOfH, s.maxPowerNeeded)
+		return nil
+	}
 	maxHTable := []int{
 		0: 0, 3: 19, 5: 29, 7: 71, 9: 89, 11: 107, 13: 125, 15: 271, 17: 305, 19: 339, 21: 373,
 		23: 407, 25: 441, 27: 475, 29: 509, 31: 1023, 33: 1025, 35: 1027}
@@ -992,7 +1002,6 @@ func (s *Session) Ghash_step1(encrypted []byte) []byte {
 	if len(body) != len(uniquePowers)*256+2 {
 		panic("len(body) != 6*256+2")
 	}
-	s.ghashOutputShare = u.XorBytes(s.ghashOutputShare, g.Cs[6].Masks[1])
 	o := 0
 	idxArray := body[o : o+len(uniquePowers)*256]
 	o += len(uniquePowers) * 256
