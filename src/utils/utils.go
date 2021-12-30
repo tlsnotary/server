@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -19,7 +18,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/crypto/salsa20/salsa"
 )
 
 func Sha256(data []byte) []byte {
@@ -71,29 +70,35 @@ func Flatten(sos [][]byte) []byte {
 	return res
 }
 
-func randomOracle(msg []byte, nonce_ uint32) []byte {
-	// sha(0)
-	var sha0 [32]byte
-	sha0_, err := hex.DecodeString("da5698be17b9b46962335799779fbeca8ce5d491c0d26243bafef9ea1837a9d8")
-	if err != nil {
-		panic(err)
+// use a fixed-key Salsa20 as a random permutator. Instead of the nonce/counter,
+// we feed the data that needs to be permuted.
+func randomOracle(msg []byte, t uint32) []byte {
+	if len(msg) != 16 {
+		panic(len(msg) != 16)
 	}
-	copy(sha0[:], sha0_[:])
-	var nonce [24]byte
-	result := make([]byte, 4)
-	binary.BigEndian.PutUint32(result, nonce_)
-	// JIGG puts e.g. 277 = [0,0,1,21] in reverse order into nonce i.e [21, 1, 0,0,0...,0]
-	for i := 0; i < 4; i++ {
-		copy(nonce[i:i+1], result[3-i:4-i])
-	}
-	out := secretbox.Seal(nil, msg, &nonce, &sha0)
-	return out[0:16]
+	// We need a 32-byte key because we use Salsa20. The last 4
+	// bytes will be filled with the index of the circuit's wire.
+	fixedKey := [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+		20, 21, 22, 23, 24, 25, 26, 27, 28, 0, 0, 0, 0}
+	tBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(tBytes, t)
+	copy(fixedKey[28:32], tBytes)
+	out := make([]byte, 16)
+	var msgArray [16]byte
+	copy(msgArray[:], msg)
+	// will xor Salsa20 output with 2nd arg and output the result into 1st arg
+	salsa.XORKeyStream(out, out, &msgArray, &fixedKey)
+	return out
 }
 
 func Decrypt(a, b []byte, t uint32, m []byte) []byte {
 	return Encrypt(a, b, t, m)
 }
 
+// Based on the the A4 method from Fig.1 and the D4 method in Fig6 of the BHKR13 paper
+// (https://eprint.iacr.org/2013/426.pdf)
+// Note that the paper doesn't prescribe a specific method to break the symmerty between A and B,
+// so we choose a circular byte shift instead of a circular bitshift as in Fig6.
 func Encrypt(a, b []byte, t uint32, m []byte) []byte {
 	// double a
 	a2 := make([]byte, 16)

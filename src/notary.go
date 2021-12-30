@@ -1,5 +1,3 @@
-// ./notary & sleep 5 && curl --data-binary '@URLFetcherDoc' 127.0.0.1:8091/setURLFetcherDoc && fg
-
 package main
 
 import (
@@ -400,6 +398,9 @@ func commitHash(w http.ResponseWriter, req *http.Request) {
 }
 
 // when notary starts we expect the admin to upload a URLFetcher document
+// it can be uploaded e.g. with:
+// curl --data-binary '@URLFetcherDoc' 127.0.0.1:10012/setURLFetcherDoc
+
 func awaitURLFetcherDoc() {
 	serverMux := http.NewServeMux()
 	srv := &http.Server{Addr: ":10012", Handler: serverMux}
@@ -441,6 +442,7 @@ func assembleCircuits() {
 }
 
 func main() {
+	// uncomment the below to profile the process's RAM usage
 	// defer profile.Start(profile.MemProfile).Stop()
 	// go func() {
 	// 	http.ListenAndServe(":8080", nil)

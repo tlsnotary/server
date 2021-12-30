@@ -305,9 +305,7 @@ func (g *Garbler) OfflinePhase(c *Circuit, rReused []byte, inputsReused []byte, 
 	if rReused != nil {
 		R = rReused
 	} else {
-		R = make([]byte, 16)
-		rand.Read(R)
-		//R = u.GetRandom(16)
+		R = u.GetRandom(16)
 		R[15] = R[15] | 0x01
 	}
 
