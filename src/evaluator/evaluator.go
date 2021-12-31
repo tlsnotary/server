@@ -227,7 +227,7 @@ func (e *Evaluator) GetCircuitBlobOffset(cNo int) (int, int, int) {
 	offset := 0
 	var ttLen, olLen int
 	for i := 1; i < len(e.g.Cs); i++ {
-		ttLen = e.g.Cs[i].Circuit.AndGateCount * 64
+		ttLen = e.g.Cs[i].Circuit.AndGateCount * 48
 		olLen = e.g.Cs[i].Circuit.OutputSize * 32
 		if i == 5 {
 			ttLen = e.g.C5Count * ttLen
@@ -249,7 +249,7 @@ func (e *Evaluator) GetCircuitBlobOffset(cNo int) (int, int, int) {
 func (e *Evaluator) SetBlob(blob []byte) {
 	offset := 0
 	for i := 1; i < len(e.g.Cs); i++ {
-		ttLen := e.g.Cs[i].Circuit.AndGateCount * 64
+		ttLen := e.g.Cs[i].Circuit.AndGateCount * 48
 		olLen := e.g.Cs[i].Circuit.OutputSize * 32
 		if i == 5 {
 			ttLen = e.g.C5Count * ttLen
@@ -318,7 +318,7 @@ func (e *Evaluator) Evaluate(cNo int, blob, ttBlob, olBlob []byte) []byte {
 
 	c := &e.g.Cs[cNo]
 	repeatCount := []int{0, 1, 1, 1, 1, e.g.C5Count, 1, e.g.C6Count}[cNo]
-	ttLen := c.Circuit.AndGateCount * 64
+	ttLen := c.Circuit.AndGateCount * 48
 
 	if len(blob) != c.NotaryNonFixedInputSize*32+
 		c.ClientNonFixedInputSize*16+
@@ -383,7 +383,6 @@ func (e *Evaluator) Evaluate(cNo int, blob, ttBlob, olBlob []byte) []byte {
 		offset += len(fixedLabels)
 		copy(ga[offset:], clientLabels)
 		offset += len(clientLabels)
-		//tt := e.ttBlobs[cNo][r*ttLen : (r+1)*ttLen]
 		tt := ttBlob[r*ttLen : (r+1)*ttLen]
 		batch[r] = batchType{&ga, &tt}
 	}
@@ -401,7 +400,6 @@ func (e *Evaluator) Evaluate(cNo int, blob, ttBlob, olBlob []byte) []byte {
 		outBits := make([]int, c.Circuit.OutputSize)
 		outputSizeBytes := c.Circuit.OutputSize * 32
 		allOutputLabelsBlob := olBlob[r*outputSizeBytes : (r+1)*outputSizeBytes]
-		//allOutputLabelsBlob := e.olBlobs[cNo][r*outputSizeBytes : (r+1)*outputSizeBytes]
 
 		for i := 0; i < len(outBits); i++ {
 			out := outputLabels[i]
@@ -447,6 +445,7 @@ func evaluate(c *garbler.Circuit, garbledAssignment *[][]byte, tt *[]byte) {
 }
 
 func evaluateAnd(g garbler.Gate, ga *[][]byte, tt *[]byte, andGateIdx int) {
+	// get wire numbers
 	in1 := g.InputWires[0]
 	in2 := g.InputWires[1]
 	out := g.OutputWire
@@ -454,10 +453,16 @@ func evaluateAnd(g garbler.Gate, ga *[][]byte, tt *[]byte, andGateIdx int) {
 	label1 := (*ga)[in1]
 	label2 := (*ga)[in2]
 
+	var cipher []byte
 	point := 2*getPoint(label1) + getPoint(label2)
-	offset := andGateIdx*64 + 16*point
-	cipher := (*tt)[offset : offset+16]
-
+	if point == 3 {
+		// GRR3: all rows with point sum of 3 have been reduced
+		// their encryption is an all-zero bytestring
+		cipher = make([]byte, 16)
+	} else {
+		offset := andGateIdx*48 + 16*point
+		cipher = (*tt)[offset : offset+16]
+	}
 	(*ga)[out] = u.Decrypt(label1, label2, g.Id, cipher)
 }
 

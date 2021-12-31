@@ -306,6 +306,8 @@ func (g *Garbler) OfflinePhase(c *Circuit, rReused []byte, inputsReused []byte, 
 		R = rReused
 	} else {
 		R = u.GetRandom(16)
+		// set the last bit of R to 1 for point-and-permute
+		// this guarantees that 2 labels of the same wire will have the opposite last bits
 		R[15] = R[15] | 0x01
 	}
 
@@ -335,7 +337,7 @@ func (g *Garbler) OfflinePhase(c *Circuit, rReused []byte, inputsReused []byte, 
 
 	andGateCount := c.AndGateCount
 	//log.Println("andGateCount is", andGateCount)
-	truthTable := make([]byte, andGateCount*64)
+	truthTable := make([]byte, andGateCount*48)
 	garble(c, &ga, R, &truthTable)
 	if len(ga) != c.WireCount {
 		panic("len(*ga) != c.wireCount")
@@ -373,7 +375,7 @@ func garble(c *Circuit, garbledAssignment *[][][]byte, R []byte, truthTable *[]b
 		gate := c.Gates[i]
 		if gate.Operation == 1 {
 			tt := garbleAnd(gate, R, garbledAssignment)
-			copy((*truthTable)[andGateIdx*64:andGateIdx*64+64], tt[0:64])
+			copy((*truthTable)[andGateIdx*48:(andGateIdx+1)*48], tt[0:48])
 			andGateIdx += 1
 		} else if gate.Operation == 0 {
 			garbleXor(gate, R, garbledAssignment)
@@ -388,37 +390,67 @@ func getPoint(arr []byte) int {
 }
 
 func garbleAnd(g Gate, R []byte, ga *[][][]byte) []byte {
+	// get wire numbers
 	in1 := g.InputWires[0]
 	in2 := g.InputWires[1]
 	out := g.OutputWire
 
-	randomLabel := make([]byte, 16)
-	rand.Read(randomLabel)
+	// get labels of each wire
+	in1_0 := (*ga)[in1][0]
+	in1_1 := (*ga)[in1][1]
+	in2_0 := (*ga)[in2][0]
+	in2_1 := (*ga)[in2][1]
 
-	(*ga)[out] = [][]byte{randomLabel, u.XorBytes(randomLabel, R)}
+	// output wires will be assigned labels later
+	var out_0, out_1 []byte
+	// rows is wire labels in a canonical order
+	var rows = [4][3]*[]byte{
+		{&in1_0, &in2_0, &out_0},
+		{&in1_0, &in2_1, &out_0},
+		{&in1_1, &in2_0, &out_0},
+		{&in1_1, &in2_1, &out_1}}
 
-	v0 := u.Encrypt((*ga)[in1][0], (*ga)[in2][0], g.Id, (*ga)[out][0])
-	v1 := u.Encrypt((*ga)[in1][0], (*ga)[in2][1], g.Id, (*ga)[out][0])
-	v2 := u.Encrypt((*ga)[in1][1], (*ga)[in2][0], g.Id, (*ga)[out][0])
-	v3 := u.Encrypt((*ga)[in1][1], (*ga)[in2][1], g.Id, (*ga)[out][1])
+	// GRR3: garbled row reduction
+	// We want to reduce a row where both labels' points are set to 1.
+	// We first need to encrypt those labels with a dummy all-zero output label. The
+	// result X will be the actual value of the output label that we need to set.
+	// After we set the output label to X and encrypt again, the result will be 0 (but
+	// we don't actually need to encrypt it again, we just know that the result will be 0)
 
-	p0 := 2*getPoint((*ga)[in1][0]) + getPoint((*ga)[in2][0])
-	p1 := 2*getPoint((*ga)[in1][0]) + getPoint((*ga)[in2][1])
-	p2 := 2*getPoint((*ga)[in1][1]) + getPoint((*ga)[in2][0])
-	p3 := 2*getPoint((*ga)[in1][1]) + getPoint((*ga)[in2][1])
-
-	truthTable := make([][]byte, 4)
-	truthTable[p0] = v0
-	truthTable[p1] = v1
-	truthTable[p2] = v2
-	truthTable[p3] = v3
-
-	var flatTable []byte
-	for i := 0; i < 4; i++ {
-		flatTable = append(flatTable, truthTable[i]...)
+	// idxToReduce is the index of the row that will be reduced
+	idxToReduce := -1
+	for i := 0; i < len(rows); i++ {
+		if getPoint(*rows[i][0]) == 1 && getPoint(*rows[i][1]) == 1 {
+			zeroWire := make([]byte, 16)
+			outWire := u.Encrypt(*rows[i][0], *rows[i][1], g.Id, zeroWire)
+			if i == 3 {
+				out_1 = outWire
+				out_0 = u.XorBytes(outWire, R)
+			} else {
+				out_0 = outWire
+				out_1 = u.XorBytes(outWire, R)
+			}
+			idxToReduce = i
+			break
+		}
+	}
+	(*ga)[out] = [][]byte{out_0, out_1}
+	if idxToReduce == -1 {
+		panic(idxToReduce == -1)
 	}
 
-	return flatTable
+	truthTable := make([][]byte, 3)
+	for i := 0; i < len(rows); i++ {
+		if i == idxToReduce {
+			// not encrypting this row because we already know that its encryption is 0
+			// and the sum of its points is 3
+			continue
+		}
+		value := u.Encrypt(*rows[i][0], *rows[i][1], g.Id, *rows[i][2])
+		point := 2*getPoint(*rows[i][0]) + getPoint(*rows[i][1])
+		truthTable[point] = value
+	}
+	return u.Flatten(truthTable)
 }
 
 func garbleXor(g Gate, R []byte, ga *[][][]byte) {

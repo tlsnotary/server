@@ -61,7 +61,7 @@ func (g *GarbledPool) Init(noSandbox bool) {
 	g.noSandbox = noSandbox
 	g.encryptedSoFar = 0
 	g.rekeyAfter = 1024 * 1024 * 1024 * 64 // 64GB
-	g.poolSize = 5
+	g.poolSize = 1
 	g.c5subdirs = []string{"50", "100", "150", "200", "300"}
 	g.pool = make(map[string][]gc, 5)
 	for _, v := range []string{"1", "2", "3", "4", "6"} {
