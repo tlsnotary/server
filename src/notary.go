@@ -123,20 +123,6 @@ func getURLFetcherDoc(w http.ResponseWriter, req *http.Request) {
 	writeResponse(URLFetcherDoc, w)
 }
 
-func ot_AllB(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ot_AllB", req.RemoteAddr)
-	body := readBody(req)
-	out := sm.getSession(string(req.URL.RawQuery)).OT_AllB(body)
-	writeResponse(out, w)
-}
-
-func ot_encLabelsForEval(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ot_encLabelsForEval", req.RemoteAddr)
-	body := readBody(req)
-	out := sm.getSession(string(req.URL.RawQuery)).OT_encLabelsForEval(body)
-	writeResponse(out, w)
-}
-
 func step1(w http.ResponseWriter, req *http.Request) {
 	log.Println("in step1", req.RemoteAddr)
 	body := readBody(req)
@@ -165,8 +151,8 @@ func step4(w http.ResponseWriter, req *http.Request) {
 	writeResponse(out, w)
 }
 
-func preInit(w http.ResponseWriter, req *http.Request) {
-	log.Println("in preInit", req.RemoteAddr)
+func init1(w http.ResponseWriter, req *http.Request) {
+	log.Println("in init1", req.RemoteAddr)
 	body := readBody(req)
 	s := sm.addSession(string(req.URL.RawQuery))
 	// copying data so that it doesn't change from under us if
@@ -176,13 +162,14 @@ func preInit(w http.ResponseWriter, req *http.Request) {
 	copy(blob, km.Blob)
 	key := *km.PrivKey
 	km.Unlock()
-	out := s.PreInit(body, blob, key)
+	out := s.Init1(body, blob, key, gp)
 	writeResponse(out, w)
 }
 
-func initNow(w http.ResponseWriter, req *http.Request) {
-	log.Println("in initNow", req.RemoteAddr)
-	out := sm.getSession(string(req.URL.RawQuery)).Init(gp)
+func init2(w http.ResponseWriter, req *http.Request) {
+	log.Println("in init2", req.RemoteAddr)
+	body := readBody(req)
+	out := sm.getSession(string(req.URL.RawQuery)).Init2(body)
 	writeResponse(out, w)
 }
 
@@ -368,27 +355,6 @@ func ghash_step3(w http.ResponseWriter, req *http.Request) {
 	writeResponse(out, w)
 }
 
-func ghash_step4(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step4", req.RemoteAddr)
-	body := readBody(req)
-	out := sm.getSession(string(req.URL.RawQuery)).Ghash_step4(body)
-	writeResponse(out, w)
-}
-
-func ghash_step5(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step5", req.RemoteAddr)
-	body := readBody(req)
-	out := sm.getSession(string(req.URL.RawQuery)).Ghash_step5(body)
-	writeResponse(out, w)
-}
-
-func ghash_step6(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step6", req.RemoteAddr)
-	body := readBody(req)
-	out := sm.getSession(string(req.URL.RawQuery)).Ghash_step6(body)
-	writeResponse(out, w)
-}
-
 func commitHash(w http.ResponseWriter, req *http.Request) {
 	log.Println("in commitHash", req.RemoteAddr)
 	body := readBody(req)
@@ -467,13 +433,10 @@ func main() {
 	// can be useful when debugging sandboxed notary
 	http.HandleFunc("/getPubKey", getPubKey)
 
-	http.HandleFunc("/preInit", preInit)
-	http.HandleFunc("/init", initNow)
+	http.HandleFunc("/init1", init1)
+	http.HandleFunc("/init2", init2)
 	http.HandleFunc("/getBlobChunk", getBlobChunk)
 	http.HandleFunc("/setBlobChunk", setBlobChunk)
-
-	http.HandleFunc("/ot_AllB", ot_AllB)
-	http.HandleFunc("/ot_encLabelsForEval", ot_encLabelsForEval)
 
 	http.HandleFunc("/step1", step1)
 	http.HandleFunc("/step2", step2)
@@ -510,9 +473,6 @@ func main() {
 	http.HandleFunc("/ghash_step1", ghash_step1)
 	http.HandleFunc("/ghash_step2", ghash_step2)
 	http.HandleFunc("/ghash_step3", ghash_step3)
-	http.HandleFunc("/ghash_step4", ghash_step4)
-	http.HandleFunc("/ghash_step5", ghash_step5)
-	http.HandleFunc("/ghash_step6", ghash_step6)
 
 	http.HandleFunc("/commitHash", commitHash)
 

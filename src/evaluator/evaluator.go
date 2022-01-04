@@ -2,7 +2,6 @@ package evaluator
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"log"
 	"math"
@@ -221,31 +220,6 @@ func (e *Evaluator) ProcessEncryptedLabels(labelsBlob []byte) {
 	}
 }
 
-// GetCircuitBlobOffset finds the offset and size of the tt+ol blob for circuit cNo
-// in the blob of all circuits
-func (e *Evaluator) GetCircuitBlobOffset(cNo int) (int, int, int) {
-	offset := 0
-	var ttLen, olLen int
-	for i := 1; i < len(e.g.Cs); i++ {
-		ttLen = e.g.Cs[i].Circuit.AndGateCount * 48
-		olLen = e.g.Cs[i].Circuit.OutputSize * 32
-		if i == 5 {
-			ttLen = e.g.C5Count * ttLen
-			olLen = e.g.C5Count * olLen
-		}
-		if i == 6 {
-			ttLen = e.g.C6Count * ttLen
-			olLen = e.g.C6Count * olLen
-		}
-		if i == cNo {
-			break
-		}
-		offset += ttLen
-		offset += olLen
-	}
-	return offset, ttLen, olLen
-}
-
 func (e *Evaluator) SetBlob(blob []byte) {
 	offset := 0
 	for i := 1; i < len(e.g.Cs); i++ {
@@ -271,8 +245,7 @@ func (e *Evaluator) SetBlob(blob []byte) {
 
 func (e *Evaluator) GetNonFixedIndexes(cNo int) []byte {
 	c := &e.g.Cs[cNo]
-	inputBits := u.BytesToBits(c.Input)
-	nonFixedBits := inputBits[:c.NotaryNonFixedInputSize]
+	nonFixedBits := c.InputBits[:c.NotaryNonFixedInputSize]
 	//get OT indexes for bits in the non-fixed inputs
 	idxArray, otArray := e.DoGetNonFixedIndexes(nonFixedBits)
 	e.nonFixedOTBits[cNo] = otArray
@@ -310,92 +283,36 @@ func (e *Evaluator) DoGetNonFixedIndexes(bits []int) ([]byte, []OTmap) {
 	return idxArray, otArray
 }
 
-func (e *Evaluator) Evaluate(cNo int, blob, ttBlob, olBlob []byte) []byte {
+func (e *Evaluator) Evaluate(cNo int, notaryLabelsBlob, clientLabelsBlob, ttBlob, olBlob []byte) []byte {
 	type batchType struct {
 		ga *[][]byte
 		tt *[]byte
 	}
 
 	c := &e.g.Cs[cNo]
-	repeatCount := []int{0, 1, 1, 1, 1, e.g.C5Count, 1, e.g.C6Count}[cNo]
-	ttLen := c.Circuit.AndGateCount * 48
+	nlBatch := u.SplitIntoChunks(notaryLabelsBlob, c.NotaryInputSize*16)
+	clBatch := u.SplitIntoChunks(clientLabelsBlob, c.ClientInputSize*16)
+	ttBatch := u.SplitIntoChunks(ttBlob, c.Circuit.AndGateCount*48)
 
-	if len(blob) != c.NotaryNonFixedInputSize*32+
-		c.ClientNonFixedInputSize*16+
-		c.ClientFixedInputSize*16*repeatCount {
-		panic("in SetLabels")
-	}
-	nonFixedEncLabelsBlob := blob[:c.NotaryNonFixedInputSize*32]
-	clientLabelsBlob := blob[c.NotaryNonFixedInputSize*32:]
-
-	inputBits := u.BytesToBits(c.Input)
-	nonFixedLabels := make([][]byte, c.NotaryNonFixedInputSize)
-	// we only need non-fixed inputs
-	for i := 0; i < c.NotaryNonFixedInputSize; i++ {
-		bit := inputBits[i]
-		e_ := nonFixedEncLabelsBlob[i*32+16*bit : i*32+16*bit+16]
-		k := e.nonFixedOTBits[cNo][i].K
-		label := u.Decrypt_generic(e_, k, 0)
-		nonFixedLabels[i] = label
-	}
-
-	allClientLabels := make([][]byte, c.ClientNonFixedInputSize+c.ClientFixedInputSize*repeatCount)
-	for i := 0; i < len(allClientLabels); i++ {
-		allClientLabels[i] = clientLabelsBlob[i*16 : i*16+16]
-	}
-
-	batch := make([]batchType, repeatCount)
-	for r := 0; r < repeatCount; r++ {
-		fixedLabels := e.fixedLabels[cNo]
-		clientLabels := allClientLabels
-
-		if cNo == 5 {
-			clientNonFixed := allClientLabels[0:c.ClientNonFixedInputSize]
-			start := c.ClientNonFixedInputSize + r*c.ClientFixedInputSize
-			clientFixed := allClientLabels[start : start+c.ClientFixedInputSize]
-			var concat [][]byte = nil
-			concat = append(concat, clientNonFixed...)
-			concat = append(concat, clientFixed...)
-			clientLabels = concat
-		} else if cNo == 6 {
-			fixedCommon := e.fixedLabels[cNo][0:160]
-			fixedUnique := e.fixedLabels[cNo][160+r*128 : 160+r*128+128]
-			var concat [][]byte = nil
-			concat = append(concat, fixedCommon...)
-			concat = append(concat, fixedUnique...)
-			fixedLabels = concat
-
-			clientNonFixed := allClientLabels[0:c.ClientNonFixedInputSize]
-			start := c.ClientNonFixedInputSize + r*c.ClientFixedInputSize
-			clientFixed := allClientLabels[start : start+c.ClientFixedInputSize]
-			var concat2 [][]byte = nil
-			concat2 = append(concat2, clientNonFixed...)
-			concat2 = append(concat2, clientFixed...)
-			clientLabels = concat2
-		}
-
+	// exeCount is how many executions of this circuit we need
+	exeCount := []int{0, 1, 1, 1, 1, e.g.C5Count, 1, e.g.C6Count}[cNo]
+	batch := make([]batchType, exeCount)
+	for r := 0; r < exeCount; r++ {
 		// put all labels into garbling assignment
 		ga := make([][]byte, c.Circuit.WireCount)
-		offset := 0
-		copy(ga[offset:], nonFixedLabels)
-		offset += len(nonFixedLabels)
-		copy(ga[offset:], fixedLabels)
-		offset += len(fixedLabels)
-		copy(ga[offset:], clientLabels)
-		offset += len(clientLabels)
-		tt := ttBlob[r*ttLen : (r+1)*ttLen]
-		batch[r] = batchType{&ga, &tt}
+		copy(ga, u.SplitIntoChunks(u.Concat(nlBatch[r], clBatch[r]), 16))
+		batch[r] = batchType{&ga, &ttBatch[r]}
 	}
 
-	batchOutputLabels := make([][][]byte, repeatCount)
-	for r := 0; r < repeatCount; r++ {
+	batchOutputLabels := make([][][]byte, exeCount)
+	for r := 0; r < exeCount; r++ {
 		evaluate(c.Circuit, batch[r].ga, batch[r].tt)
 		outputLabels := (*batch[r].ga)[len((*batch[r].ga))-c.Circuit.OutputSize:]
 		batchOutputLabels[r] = outputLabels
 	}
 
 	var output []byte
-	for r := 0; r < repeatCount; r++ {
+	for r := 0; r < exeCount; r++ {
 		outputLabels := batchOutputLabels[r]
 		outBits := make([]int, c.Circuit.OutputSize)
 		outputSizeBytes := c.Circuit.OutputSize * 32
@@ -416,14 +333,9 @@ func (e *Evaluator) Evaluate(cNo int, blob, ttBlob, olBlob []byte) []byte {
 	}
 
 	c.Output = output
-	resHash := sha256.Sum256(c.Output)
-	e.CommitHash[cNo] = resHash[:]
-
-	salt := make([]byte, 32)
-	rand.Read(salt)
-	e.Salt[cNo] = salt
-	saltedHash := sha256.Sum256(u.Concat(e.CommitHash[cNo], salt))
-	return saltedHash[:]
+	e.CommitHash[cNo] = u.Sha256(c.Output)
+	e.Salt[cNo] = u.GetRandom(32)
+	return u.Sha256(u.Concat(e.CommitHash[cNo], e.Salt[cNo]))
 }
 
 func evaluate(c *garbler.Circuit, garbledAssignment *[][]byte, tt *[]byte) {

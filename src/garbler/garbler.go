@@ -2,9 +2,7 @@ package garbler
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"io/ioutil"
-	"log"
 	"math/big"
 	u "notary/utils"
 	"os"
@@ -41,7 +39,7 @@ type Garbler struct {
 type CData struct {
 	OT                      []OTstruct // parsed OT
 	Ol                      []byte     // output labels
-	Il                      Labels     // input labels
+	Il                      []byte     // input labels
 	Tt                      []byte     // truth table
 	NotaryInputSize         int        // in bits
 	NotaryNonFixedInputSize int
@@ -51,22 +49,19 @@ type CData struct {
 	ClientFixedInputSize    int
 	OutputSize              int    // in bits
 	Output                  []byte // garbler+evaluator output of circuit
-	Input                   []byte // garbler's input for this circuit
-	PmsOuterHash            []byte // only for c1
-	MsOuterHash             []byte // output from c2
-	Masks                   [][]byte
-	Circuit                 *Circuit
-	TagSharesBlob           []byte
-	FixedInputs             []int // array of 0 and 1 for evaluator's fixed inputs
+	// InputBits start with least input bit at index [0]
+	InputBits     []int  // notary's input for this circuit
+	PmsOuterHash  []byte // only for c1
+	MsOuterHash   []byte // output from c2
+	Masks         [][]byte
+	Circuit       *Circuit
+	TagSharesBlob []byte
+	FixedInputs   []int // array of 0 and 1 for evaluator's fixed inputs
 }
 
-func (p *CData) Init(nis, nnfis, cis, cnfis, os int) {
+func (p *CData) Init(nis, cis, os int) {
 	p.NotaryInputSize = nis
-	p.NotaryNonFixedInputSize = nnfis
-	p.NotaryFixedInputSize = p.NotaryInputSize - p.NotaryNonFixedInputSize
 	p.ClientInputSize = cis
-	p.ClientNonFixedInputSize = cnfis
-	p.ClientFixedInputSize = p.ClientInputSize - p.ClientNonFixedInputSize
 	p.OutputSize = os
 }
 
@@ -106,20 +101,19 @@ type Labels struct {
 }
 
 type Blobs struct {
-	Il Labels // input labels
-	Tt []byte // truth table
+	Il []byte // input labels
+	Tt []byte // truth tables
 	Ol []byte // output labels
-	R  []byte
 }
 
-func (g *Garbler) Init(ilBlobs []Labels, circuits []*Circuit) {
+func (g *Garbler) Init(ilBlobs [][]byte, circuits []*Circuit) {
 	g.Cs = make([]CData, 7)
-	g.Cs[1].Init(512, 256, 512, 256, 512)
-	g.Cs[2].Init(512, 256, 640, 384, 512)
-	g.Cs[3].Init(832, 256, 1568, 768, 800)
-	g.Cs[4].Init(672, 416, 960, 480, 480)
-	g.Cs[5].Init(160, 0, 308, 160, 128)
-	g.Cs[6].Init(288, 0, 304, 160, 128)
+	g.Cs[1].Init(512, 512, 512)
+	g.Cs[2].Init(512, 640, 512)
+	g.Cs[3].Init(832, 1568, 800)
+	g.Cs[4].Init(672, 960, 480)
+	g.Cs[5].Init(160, 308, 128)
+	g.Cs[6].Init(288, 304, 128)
 
 	for i := 1; i < len(g.Cs); i++ {
 		c := &g.Cs[i]
@@ -196,51 +190,6 @@ func (g *Garbler) SeparateLabels(blob []byte, c CData) Labels {
 	copy(labels.ClientFixed, blob[offset:offset+c.ClientFixedInputSize*32])
 	offset += c.ClientFixedInputSize * 32
 	return labels
-}
-
-func (g *Garbler) C_getEncNonFixedLabels(cNo int, idxBlob []byte) []byte {
-	c := &g.Cs[cNo]
-	if len(idxBlob) != 2*c.ClientNonFixedInputSize {
-		log.Println(cNo)
-		panic("len(idxArr)!= 2*256")
-	}
-
-	var encLabels []byte
-	for i := 0; i < c.ClientNonFixedInputSize; i++ {
-		idx := int(binary.BigEndian.Uint16(idxBlob[i*2 : i*2+2]))
-		k0 := g.AllNonFixedOT[idx][0]
-		k1 := g.AllNonFixedOT[idx][1]
-		m0 := c.Il.ClientNonFixed[i*32 : i*32+16]
-		m1 := c.Il.ClientNonFixed[i*32+16 : i*32+32]
-		e0 := u.Encrypt_generic(m0, k0, 0)
-		e1 := u.Encrypt_generic(m1, k1, 0)
-		encLabels = append(encLabels, e0...)
-		encLabels = append(encLabels, e1...)
-	}
-	return encLabels
-}
-
-//  C_getInputLabels returns notary's input labels for the circuit
-func (g *Garbler) C_getInputLabels(cNo int) []byte {
-	c := &g.Cs[cNo]
-	inputBytes := c.Input
-
-	if (cNo != 6 && len(inputBytes)*8 != c.NotaryInputSize) ||
-		(cNo == 6 && len(inputBytes)*8 != 160+128*g.C6Count) {
-		log.Println("inputBytes", inputBytes)
-		log.Println("len(inputBytes)", len(inputBytes))
-		panic("len(inputBytes)*8 != c.NotaryInputSiz")
-	}
-
-	input := new(big.Int).SetBytes(inputBytes)
-	inputLabelBlob := u.Concat(c.Il.NotaryNonFixed, c.Il.NotaryFixed)
-	var inputLabels []byte
-	for i := 0; i < len(inputBytes)*8; i++ {
-		bit := int(input.Bit(i))
-		label := inputLabelBlob[i*32+bit*16 : i*32+bit*16+16]
-		inputLabels = append(inputLabels, label...)
-	}
-	return inputLabels
 }
 
 func (g *Garbler) ParseCircuit(cNo_ int) *Circuit {

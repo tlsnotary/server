@@ -14,7 +14,7 @@ import (
 )
 
 // gc describes a garbled circuit file
-// id is the name of the file (for c5 this is the name of the dir)
+// id is the name of the file
 // keyIdx is the index of a key in g.key used to encrypt the gc
 type gc struct {
 	id     string
@@ -46,7 +46,10 @@ type GarbledPool struct {
 	// poolc5 is like pool except map's <key> is one of g.c5subdirs and gc.id
 	// is a dir containing <key> amount of garblings
 	poolc5 map[string][]gc
-	// poolSize is how many pre-garblings of each circuit we want to have
+	// poolSize is how many concurrent TLSNotary sessions we want to support
+	// the server will maintain a pool of garbled circuits depending on this value
+	// the amount of c5 circuits will be poolSize*100 because on average one
+	// session needs that many garbled c5 circuits
 	poolSize int
 	Circuits []*garbler.Circuit
 	grb      garbler.Garbler
@@ -62,26 +65,21 @@ func (g *GarbledPool) Init(noSandbox bool) {
 	g.encryptedSoFar = 0
 	g.rekeyAfter = 1024 * 1024 * 1024 * 64 // 64GB
 	g.poolSize = 1
-	g.c5subdirs = []string{"50", "100", "150", "200", "300"}
-	g.pool = make(map[string][]gc, 5)
-	for _, v := range []string{"1", "2", "3", "4", "6"} {
+	g.pool = make(map[string][]gc, 6)
+	for _, v := range []string{"1", "2", "3", "4", "5", "6"} {
 		g.pool[v] = []gc{}
-	}
-	g.poolc5 = make(map[string][]gc, len(g.c5subdirs))
-	for _, v := range g.c5subdirs {
-		g.poolc5[v] = []gc{}
 	}
 	g.Circuits = make([]*garbler.Circuit, 7)
 	for _, idx := range []int{1, 2, 3, 4, 5, 6} {
 		g.Circuits[idx] = g.grb.ParseCircuit(idx)
 	}
 	g.Cs = make([]garbler.CData, 7)
-	g.Cs[1].Init(512, 256, 512, 256, 512)
-	g.Cs[2].Init(512, 256, 640, 384, 512)
-	g.Cs[3].Init(832, 256, 1568, 768, 800)
-	g.Cs[4].Init(672, 416, 960, 480, 480)
-	g.Cs[5].Init(160, 0, 308, 160, 128)
-	g.Cs[6].Init(288, 0, 304, 160, 128)
+	g.Cs[1].Init(512, 512, 512)
+	g.Cs[2].Init(512, 640, 512)
+	g.Cs[3].Init(832, 1568, 800)
+	g.Cs[4].Init(672, 960, 480)
+	g.Cs[5].Init(160, 308, 128)
+	g.Cs[6].Init(288, 304, 128)
 	curDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
 		panic(err)
@@ -106,13 +104,6 @@ func (g *GarbledPool) Init(noSandbox bool) {
 				panic(err)
 			}
 		}
-		// for c5 we need different sizes
-		for _, idx := range g.c5subdirs {
-			err = os.Mkdir(filepath.Join(g.gPDirPath, "c5", idx), 0755)
-			if err != nil {
-				panic(err)
-			}
-		}
 	} else {
 		// the dir already exists
 		if !g.noSandbox {
@@ -126,76 +117,44 @@ func (g *GarbledPool) Init(noSandbox bool) {
 
 // returns Blobs struct for each circuit
 func (g *GarbledPool) GetBlobs(c5Count int) []garbler.Blobs {
-	if c5Count > 1024 {
-		panic("c5Count > 1024")
+	if c5Count > 1026 {
+		panic("c5Count > 1026")
 	}
 	allBlobs := make([]garbler.Blobs, len(g.Cs))
 
-	// fetch non-c5 blobs
+	// fetch blobs
 	for i := 1; i < len(allBlobs); i++ {
 		iStr := strconv.Itoa(i)
+		var count int
 		if i == 5 {
-			continue // we will deal with c5 below
+			count = c5Count
+		} else {
+			count = 1
 		}
-		if len(g.pool[iStr]) == 0 {
+		if len(g.pool[iStr]) < count {
 			// give monitorPool some time to fill up the pool, then repeat
 			log.Println("pool is not ready, sleeping", iStr)
 			time.Sleep(time.Second)
 			i = i - 1
 			continue
-		} else {
+		}
+		for j := 0; j < count; j++ {
 			g.Lock()
 			gc := g.pool[iStr][0]
 			g.pool[iStr] = g.pool[iStr][1:]
 			g.Unlock()
 			blob := g.fetchBlob(iStr, gc)
 			il, tt, ol := g.deBlob(blob)
-			allBlobs[i].Il = g.grb.SeparateLabels(il, g.Cs[i])
-			allBlobs[i].Tt = tt
-			allBlobs[i].Ol = ol
+			allBlobs[i].Il = append(allBlobs[i].Il, il...)
+			allBlobs[i].Tt = append(allBlobs[i].Tt, tt...)
+			allBlobs[i].Ol = append(allBlobs[i].Ol, ol...)
 		}
-	}
-	// fetch c5 blobs. Find out from which subdir to fetch
-	var dirToFetch string
-	for _, dirToFetch = range g.c5subdirs {
-		dirInt, _ := strconv.Atoi(dirToFetch)
-		if c5Count <= dirInt {
-			break
-		}
-	}
-	// loop until there is something to fetch
-	for {
-		if len(g.poolc5[dirToFetch]) == 0 {
-			// give monitorPool some time to fill up the pool, then repeat
-			log.Println("pool is not ready, sleeping", dirToFetch)
-			time.Sleep(time.Second)
-			continue
-		} else {
-			break
-		}
-	}
-	g.Lock()
-	gc := g.poolc5[dirToFetch][0]
-	g.poolc5[dirToFetch] = g.poolc5[dirToFetch][1:]
-	g.Unlock()
-	blobs := g.fetchC5Blobs(dirToFetch, gc, c5Count)
-	il, tt, ol := g.deBlob(blobs[0])
-	allBlobs[5].Il = g.grb.SeparateLabels(il, g.Cs[5])
-	allBlobs[5].Tt = tt
-	allBlobs[5].Ol = ol
-	// all circuits after 1st have only ClientFixed input labels
-	// because all other labels from 1st are reused
-	for i := 1; i < len(blobs); i++ {
-		il, tt, ol := g.deBlob(blobs[i])
-		allBlobs[5].Tt = append(allBlobs[5].Tt, tt...)
-		allBlobs[5].Ol = append(allBlobs[5].Ol, ol...)
-		allBlobs[5].Il.ClientFixed = append(allBlobs[5].Il.ClientFixed, il...)
 	}
 	return allBlobs
 }
 
 func (g *GarbledPool) loadPoolFromDisk() {
-	for _, idx := range []string{"1", "2", "3", "4", "6"} {
+	for _, idx := range []string{"1", "2", "3", "4", "5", "6"} {
 		files, err := ioutil.ReadDir(filepath.Join(g.gPDirPath, "c"+idx))
 		if err != nil {
 			panic(err)
@@ -205,20 +164,8 @@ func (g *GarbledPool) loadPoolFromDisk() {
 			gcs = append(gcs, gc{id: file.Name(), keyIdx: 0})
 		}
 		g.pool[idx] = gcs
+		log.Println("loaded ", len(g.pool[idx]), " garbled circuits for circuit ", idx)
 	}
-	for _, idx := range g.c5subdirs {
-		files, err := ioutil.ReadDir(filepath.Join(g.gPDirPath, "c5", idx))
-		if err != nil {
-			panic(err)
-		}
-		var gcs []gc
-		for _, file := range files {
-			gcs = append(gcs, gc{id: file.Name(), keyIdx: 0})
-		}
-		g.poolc5[idx] = gcs
-	}
-	log.Println(g.pool)
-	log.Println(g.poolc5)
 }
 
 // garbles a circuit and returns a blob
@@ -279,37 +226,47 @@ func (g *GarbledPool) monitor() {
 			g.encryptedSoFar = 0
 		}
 		// check if gc pool needs to be replenished
-		for k, v := range g.pool {
-			if len(v) < g.poolSize {
-				diff := g.poolSize - len(v)
-				for i := 0; i < diff; i++ {
-					//log.Println("in monitorPool adding c", k)
-					kInt, _ := strconv.Atoi(k)
-					blob := g.garbleCircuit(kInt)
-					randName := u.RandString()
-					g.saveBlob(filepath.Join(g.gPDirPath, "c"+k, randName), blob)
-					g.Lock()
-					g.pool[k] = append(g.pool[k], gc{id: randName, keyIdx: len(g.keys) - 1})
-					g.Unlock()
+		diff := 0
+		var k string
+		var v []gc
+		for k, v = range g.pool {
+			if k != "5" {
+				if len(v) >= g.poolSize {
+					continue
+				} else {
+					diff = g.poolSize - len(v)
+					break
+				}
+			} else {
+				// we need at least 1026 garblings for a max TLS record size
+				max := u.Max(g.poolSize*100, 1026)
+				if len(v) >= max {
+					continue
+				} else {
+					diff = max - len(v)
+					break
 				}
 			}
 		}
-		for k, v := range g.poolc5 {
-			if len(v) < g.poolSize {
-				diff := g.poolSize - len(v)
-				for i := 0; i < diff; i++ {
-					//log.Println("in monitorPool adding c5", k)
-					kInt, _ := strconv.Atoi(k)
-					blobs := g.garbleC5Circuits(kInt)
-					randName := u.RandString()
-					g.saveC5Blobs(filepath.Join(g.gPDirPath, "c5", k, randName), blobs)
-					g.Lock()
-					g.poolc5[k] = append(g.poolc5[k], gc{id: randName, keyIdx: len(g.keys) - 1})
-					g.Unlock()
-				}
+		// golang doesnt allow to modify map while iterating it
+		// that's why we break the iteration
+		if diff > 0 {
+			// need to replenish the pool
+			for i := 0; i < diff; i++ {
+				//log.Println("in monitorPool adding c", k)
+				kInt, _ := strconv.Atoi(k)
+				blob := g.garbleCircuit(kInt)
+				randName := u.RandString()
+				g.saveBlob(filepath.Join(g.gPDirPath, "c"+k, randName), blob)
+				g.Lock()
+				g.pool[k] = append(g.pool[k], gc{id: randName, keyIdx: len(g.keys) - 1})
+				g.Unlock()
 			}
+			// don't sleep because we may have other circuits which are waiting
+			// to be replenished
+			continue
 		}
-		time.Sleep(120 * time.Second)
+		time.Sleep(time.Second)
 	}
 }
 

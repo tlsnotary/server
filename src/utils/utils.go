@@ -26,6 +26,19 @@ func Sha256(data []byte) []byte {
 	return ret[:]
 }
 
+// split a slice into smaller slices of size "chunkSize" each
+func SplitIntoChunks(data []byte, chunkSize int) [][]byte {
+	if len(data)%chunkSize != 0 {
+		panic("len(data) % chunkSize != 0")
+	}
+	chunkCount := len(data) / chunkSize
+	chunks := make([][]byte, chunkCount)
+	for i := 0; i < chunkCount; i++ {
+		chunks[i] = data[i*chunkSize : (i+1)*chunkSize]
+	}
+	return chunks
+}
+
 // port of sodium.crypto_generichash
 func Generichash(length int, msg []byte) []byte {
 	h, err := blake2b.New(length, nil)
@@ -212,9 +225,10 @@ func BlockMultOld(val, encZero *big.Int) *big.Int {
 	return res
 }
 
-func BlockMult(x_, y_ *big.Int) *big.Int {
-	x := new(big.Int).Set(x_)
-	y := new(big.Int).Set(y_)
+// Galois field multiplication of two 128-bit blocks reduced by the GCM polynomial
+func BlockMult(x_, y_ []byte) []byte {
+	x := new(big.Int).SetBytes(x_)
+	y := new(big.Int).SetBytes(y_)
 	res := big.NewInt(0)
 	_1 := big.NewInt(1)
 	R, ok := new(big.Int).SetString("E1000000000000000000000000000000", 16)
@@ -230,7 +244,7 @@ func BlockMult(x_, y_ *big.Int) *big.Int {
 		tmp5 := new(big.Int).Rsh(x, 1)
 		x = new(big.Int).Xor(tmp5, tmp4)
 	}
-	return res
+	return To16Bytes(res)
 }
 
 // return a table of byte values of x after each of the 128 rounds of BlockMult
@@ -287,8 +301,7 @@ func FreeSquare(powersOfH *[][]byte, maxPowerNeeded int) {
 				continue
 			}
 			prevPower := (*powersOfH)[power/2]
-			bigIntH := new(big.Int).SetBytes(prevPower)
-			(*powersOfH)[power] = To16Bytes(BlockMult(bigIntH, bigIntH))
+			(*powersOfH)[power] = BlockMult(prevPower, prevPower)
 		}
 	}
 }
@@ -314,6 +327,13 @@ func To32Bytes(x *big.Int) []byte {
 	buf := make([]byte, 32)
 	x.FillBytes(buf)
 	return buf
+}
+
+func Max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func gf_2_128_mul(authKey, y, R *big.Int) *big.Int {
@@ -586,6 +606,50 @@ func AESGCMdecrypt(key []byte, ctWithNonce []byte) []byte {
 		panic(err.Error())
 	}
 	return pt
+}
+
+// AEC-CTR encrypt data, setting initial counter to 0
+func AESCTRencrypt(key []byte, plaintext []byte) []byte {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err.Error())
+	}
+	iv := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	stream := cipher.NewCTR(block, iv)
+	ciphertext := make([]byte, len(plaintext))
+	stream.XORKeyStream(ciphertext, plaintext)
+	return ciphertext
+}
+
+// AEC-CTR decrypt data, setting initial counter to 0
+func AESCTRdecrypt(key []byte, ciphertext []byte) []byte {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err.Error())
+	}
+	iv := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	stream := cipher.NewCTR(block, iv)
+	plaintext := make([]byte, len(ciphertext))
+	stream.XORKeyStream(plaintext, ciphertext)
+	return plaintext
+}
+
+// AEC-ECB encrypt data
+func AESECBencrypt(key []byte, plaintext []byte) []byte {
+	if len(plaintext)%16 != 0 {
+		panic("len(plaintext) % 16 != 0")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err.Error())
+	}
+	// there is no dedicated ECB mode in golang, crypting block by block
+	ciphertext := make([]byte, len(plaintext))
+	blockCount := len(plaintext) / 16
+	for i := 0; i < blockCount; i++ {
+		block.Encrypt(ciphertext[i*16:i*16+16], plaintext[i*16:i*16+16])
+	}
+	return ciphertext
 }
 
 func RandInt(min, max int) int {
