@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"io"
 	"log"
 	"math"
@@ -16,27 +13,23 @@ import (
 	"notary/garbled_pool"
 	"notary/garbler"
 	"notary/ot"
+	"notary/paillier2pc"
 	u "notary/utils"
 
 	"os"
 	"path/filepath"
 
-	ec "crypto/elliptic"
 	"time"
-
-	paillier "github.com/roasbeef/go-go-gadget-paillier"
 )
 
 type Session struct {
-	e                       *evaluator.Evaluator
-	g                       *garbler.Garbler
-	p256                    ec.Curve
-	qPriv, qPrivGX, qPrivGY *big.Int
-	paillierPrivKey         *paillier.PrivateKey
-	ghashOutputShare        []byte   //notary's share of gcm's ghash output
-	powersOfH               [][]byte // contains notary's share for each power of H
-	maxPowerNeeded          int
-	maxOddPowerNeeded       int
+	e                 *evaluator.Evaluator
+	g                 *garbler.Garbler
+	p2pc              *paillier2pc.Paillier2PC
+	ghashOutputShare  []byte   //notary's share of gcm's ghash output
+	powersOfH         [][]byte // contains notary's share for each power of H
+	maxPowerNeeded    int
+	maxOddPowerNeeded int
 	// serverPubkey is EC pubkey used during 3-party ECDH secret negotiation.
 	// This pubkey will be included in notary's signature
 	serverPubkey []byte
@@ -130,6 +123,7 @@ func (s *Session) Init1(body, blob []byte, signingKey ecdsa.PrivateKey,
 	s.e = new(evaluator.Evaluator)
 	s.otS = new(ot.OTSender)
 	s.otR = new(ot.OTReceiver)
+	s.p2pc = new(paillier2pc.Paillier2PC)
 	s.signingKey = &signingKey
 	// the first 64 bytes are client pubkey for ECDH
 	o := 0
@@ -192,19 +186,9 @@ func (s *Session) Init1(body, blob []byte, signingKey ecdsa.PrivateKey,
 	s.sivShare = g.Cs[3].Masks[3]
 	s.civShare = g.Cs[3].Masks[4]
 
+	s.p2pc.Init()
 	g.One = big.NewInt(1)
 	g.Zero = big.NewInt(0)
-
-	s.p256 = ec.P256()
-	// we need an int in range [1, N-1]
-	nMinusOne := new(big.Int).Sub(s.p256.Params().N, g.One)
-	randInt, err := rand.Int(rand.Reader, nMinusOne) //returns range [0, max)
-	if err != nil {
-		panic("crypto random error")
-	}
-	s.qPriv = new(big.Int).Add(randInt, g.One)
-	s.qPrivGX, s.qPrivGY = s.p256.ScalarBaseMult(s.qPriv.Bytes())
-	s.paillierPrivKey, _ = paillier.GenerateKey(rand.Reader, 1536)
 
 	// for each circuit send truth table and output labels
 	var blobForClient []byte
@@ -406,169 +390,28 @@ func (s *Session) SetBlobChunk(encrypted []byte) []byte {
 func (s *Session) Step1(encrypted []byte) []byte {
 	s.sequenceCheck(5)
 	body := s.decryptFromClient(encrypted)
-	// we get server ec pubkey, multiply it by qPriv to get
-	// our additive share of pms
-
-	type Step1 struct {
-		ServerX string
-		ServerY string
-		Share1X string
-		Share1Y string
-	}
-	var step1 Step1
-	p256 := s.p256
-
-	json.Unmarshal([]byte(string(body)), &step1)
-
-	serverX := new(big.Int)
-	serverX.SetString(step1.ServerX, 16)
-	xBytes := make([]byte, 32)
-	serverX.FillBytes(xBytes)
-	serverY := new(big.Int)
-	serverY.SetString(step1.ServerY, 16)
-	yBytes := make([]byte, 32)
-	serverY.FillBytes(yBytes)
-	s.serverPubkey = u.Concat([]byte{0x04}, xBytes, yBytes)
-
-	// share1X and Y are here for debug purposes
-	// they should not be revealed by the client
-	share1X := new(big.Int)
-	share1X.SetString(step1.Share1X, 16)
-	share1Y := new(big.Int)
-	share1Y.SetString(step1.Share1Y, 16)
-	shareX, shareY := p256.ScalarMult(serverX, serverY, s.qPriv.Bytes())
-
-	Pxq, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, shareX.Bytes())
-	// negative xq mod p == p - xq
-	nxq := new(big.Int).Sub(p256.Params().P, shareX)
-	Pnxq, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, nxq.Bytes())
-	//yq**2 mod p
-	two := big.NewInt(2)
-	yq2 := new(big.Int).Exp(shareY, two, p256.Params().P)
-	// -2*yq mod p == p - 2*yq
-	n2yq := new(big.Int).Mod(
-		new(big.Int).Sub(p256.Params().P, new(big.Int).Mul(shareY, two)),
-		p256.Params().P)
-	Pyq2, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, yq2.Bytes())
-	Pn2yq, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, n2yq.Bytes())
-
-	var json = `{"Pxq":"` + hex.EncodeToString(Pxq) + `",
-				 "Pnxq":"` + hex.EncodeToString(Pnxq) + `",
-				 "Pyq2":"` + hex.EncodeToString(Pyq2) + `",
-				 "Pn2yq":"` + hex.EncodeToString(Pn2yq) + `",
-				 "n":"` + hex.EncodeToString(s.paillierPrivKey.PublicKey.N.Bytes()) + `",
-				 "g":"` + hex.EncodeToString(s.paillierPrivKey.PublicKey.G.Bytes()) + `",
-				 "qPrivGX":"` + hex.EncodeToString(s.qPrivGX.Bytes()) + `",
-				 "qPrivGY":"` + hex.EncodeToString(s.qPrivGY.Bytes()) + `"}`
-
-	return s.encryptToClient([]byte(json))
+	var resp []byte
+	s.serverPubkey, resp = s.p2pc.Step1(body)
+	return s.encryptToClient(resp)
 }
 
 func (s *Session) Step2(encrypted []byte) []byte {
 	s.sequenceCheck(6)
 	body := s.decryptFromClient(encrypted)
-	type Step2 struct {
-		PABC  string
-		Cmodp string
-	}
-	var step2 Step2
-	json.Unmarshal([]byte(string(body)), &step2)
-
-	PABC, err := hex.DecodeString(step2.PABC)
-	if err != nil {
-		panic(err)
-	}
-	Cmodp_bytes, err := hex.DecodeString(step2.Cmodp)
-	if err != nil {
-		panic(err)
-	}
-
-	DABC_bytes, _ := paillier.Decrypt(s.paillierPrivKey, PABC)
-	DABC := new(big.Int).SetBytes(DABC_bytes)
-	Cmodp := new(big.Int).SetBytes(Cmodp_bytes)
-	AB := new(big.Int).Mod(new(big.Int).Sub(DABC, Cmodp), s.p256.Params().P)
-	three := big.NewInt(3)
-	pow := new(big.Int).Sub(s.p256.Params().P, three)
-	ABraised := new(big.Int).Exp(AB, pow, s.p256.Params().P)
-	PABraised, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, ABraised.Bytes())
-
-	var json = `{"PABraised":"` + hex.EncodeToString(PABraised) + `"}`
-	return s.encryptToClient([]byte(json))
+	return s.encryptToClient(s.p2pc.Step2(body))
 }
 
 func (s *Session) Step3(encrypted []byte) []byte {
 	s.sequenceCheck(7)
 	body := s.decryptFromClient(encrypted)
-	type Step3 struct {
-		B      string
-		A2modp string
-		D      string
-		C2modp string
-	}
-	var step3 Step3
-	json.Unmarshal([]byte(string(body)), &step3)
-
-	b, err := hex.DecodeString(step3.B)
-	if err != nil {
-		panic(err)
-	}
-	a2modp_bytes, err := hex.DecodeString(step3.A2modp)
-	if err != nil {
-		panic(err)
-	}
-	d, err := hex.DecodeString(step3.D)
-	if err != nil {
-		panic(err)
-	}
-	c2modp_bytes, err := hex.DecodeString(step3.C2modp)
-	if err != nil {
-		panic(err)
-	}
-
-	decrB_bytes, _ := paillier.Decrypt(s.paillierPrivKey, b)
-	decrB := new(big.Int).SetBytes(decrB_bytes)
-	a2modp := new(big.Int).SetBytes(a2modp_bytes)
-	termBa1 := new(big.Int).Mod(
-		new(big.Int).Sub(decrB, a2modp),
-		s.p256.Params().P)
-	decrD_bytes, _ := paillier.Decrypt(s.paillierPrivKey, d)
-	decrD := new(big.Int).SetBytes(decrD_bytes)
-	c2modp := new(big.Int).SetBytes(c2modp_bytes)
-	termAc2 := new(big.Int).Mod(
-		new(big.Int).Sub(decrD, c2modp),
-		s.p256.Params().P)
-	termABmasked := new(big.Int).Mod(
-		new(big.Int).Mul(termBa1, termAc2),
-		s.p256.Params().P)
-	PtermABmasked, _ := paillier.Encrypt(&s.paillierPrivKey.PublicKey, termABmasked.Bytes())
-
-	var json = `{"PtermABmasked":"` + hex.EncodeToString(PtermABmasked) + `"}`
-	return s.encryptToClient([]byte(json))
+	return s.encryptToClient(s.p2pc.Step3(body))
 }
 
 func (s *Session) Step4(encrypted []byte) []byte {
 	s.sequenceCheck(8)
 	body := s.decryptFromClient(encrypted)
-	type Step4 struct {
-		Px2unreduced string
-	}
-	var step4 Step4
-	json.Unmarshal([]byte(string(body)), &step4)
-
-	Px2unreduced, err := hex.DecodeString(step4.Px2unreduced)
-	if err != nil {
-		panic(err)
-	}
-
-	decr_bytes, _ := paillier.Decrypt(s.paillierPrivKey, Px2unreduced)
-	decr := new(big.Int).SetBytes(decr_bytes)
-	s.notaryPMSShare = make([]byte, 32)
-	new(big.Int).Mod(decr, s.p256.Params().P).FillBytes(s.notaryPMSShare)
-
-	var json = `{"x2":"` + hex.EncodeToString(s.notaryPMSShare) + `",
-				"qPriv":"` + hex.EncodeToString(s.qPriv.Bytes()) + `"}`
-
-	return s.encryptToClient([]byte(json))
+	s.notaryPMSShare = s.p2pc.Step4(body)
+	return nil
 }
 
 // c_step1 is common for all c circuits
