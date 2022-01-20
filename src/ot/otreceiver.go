@@ -1,7 +1,6 @@
 package ot
 
 import (
-	"log"
 	u "notary/utils"
 
 	"github.com/bwesterb/go-ristretto"
@@ -40,7 +39,6 @@ func (o *OTReceiver) SetupStep1() ([]byte, []byte) {
 	return o.A.Bytes(), seedCommit
 }
 
-// Step 3
 func (o *OTReceiver) SetupStep2(allBsBlob, senderSeedShare []byte) ([]byte, []byte, []byte, []byte) {
 	// compute key_0 and key_1 for each B of the base OT
 	if (len(allBsBlob) != 128*32) || (len(senderSeedShare) != 16) {
@@ -95,15 +93,13 @@ func (o *OTReceiver) SetupStep2(allBsBlob, senderSeedShare []byte) ([]byte, []by
 
 	// now we have instances of Random OT where depending on r's bit,
 	// each row in RT0 equals to a row either in RQ0 or RQ1
-	log.Println("done 2")
 	// use Beaver Derandomization [Beaver91] to convert randomOT into standardOT
 	return u.Concat(encryptedColumns...), o.seedShare, x, t
 }
 
-// Step 5
-// request Oblivious Transfer from the Sender for the choice bits
-func (o *OTReceiver) RequestMaskedOT(bitsArr []int) []byte {
-	if o.receivedSoFar+len(bitsArr) > o.otCount {
+// CreateRequest creates a request for OT for the choice bits.
+func (o *OTReceiver) CreateRequest(choiceBits []int) []byte {
+	if o.receivedSoFar+len(choiceBits) > o.otCount {
 		panic("o.receivedSoFar + len(bitsArr) > o.otCount")
 	}
 	if o.expectingResponseSize != 0 {
@@ -113,41 +109,42 @@ func (o *OTReceiver) RequestMaskedOT(bitsArr []int) []byte {
 	// no flip needed, 1 means a flip is needed
 	// pad the bitcount to a multiple of 8
 	dropCount := 0
-	if len(bitsArr)%8 > 0 {
-		dropCount = 8 - len(bitsArr)%8
+	if len(choiceBits)%8 > 0 {
+		dropCount = 8 - len(choiceBits)%8
 	}
-	bitsToFlip := make([]int, len(bitsArr)+dropCount)
-	for i := 0; i < len(bitsArr); i++ {
-		bitsToFlip[i] = bitsArr[i] ^ o.rBits[o.receivedSoFar+i]
+	bitsToFlip := make([]int, len(choiceBits)+dropCount)
+	for i := 0; i < len(choiceBits); i++ {
+		bitsToFlip[i] = choiceBits[i] ^ o.rBits[o.receivedSoFar+i]
 	}
 	for i := 0; i < dropCount; i++ {
-		bitsToFlip[len(bitsArr)+i] = 0
+		bitsToFlip[len(choiceBits)+i] = 0
 	}
-	o.expectingResponseSize = len(bitsArr)
+	o.expectingResponseSize = len(choiceBits)
 	// prefix with the amount of bits that Sender needs to drop
 	// in cases when bitsArr.length is not a multiple of 8
 	return u.Concat([]byte{byte(dropCount)}, u.BitsToBytes(bitsToFlip))
 }
 
-// Step 7
-// for every choice bit in bitsArr, unmask one of the two 16-byte messages
-func (o *OTReceiver) UnmaskOT(bitsArr []int, encodedOT []byte) []byte {
-	if (o.expectingResponseSize != len(bitsArr)) ||
+// ParseResponse parses (i.e. decodes) the OT response from the OT sender and
+// returns the plaintext result of OT.
+// For every choice bit, it unmasks one of the two 16-byte messages.
+func (o *OTReceiver) ParseResponse(choiceBits []int, encodedOT []byte) []byte {
+	if (o.expectingResponseSize != len(choiceBits)) ||
 		(o.expectingResponseSize*32 != len(encodedOT)) {
 		panic("o.expectingResponseSize issue")
 	}
-	decodedArr := make([][]byte, len(bitsArr))
-	for i := 0; i < len(bitsArr); i++ {
+	decodedArr := make([][]byte, len(choiceBits))
+	for i := 0; i < len(choiceBits); i++ {
 		mask := o.RT0[(o.receivedSoFar+i)*16 : (o.receivedSoFar+i)*16+16]
 		m0 := encodedOT[i*32 : i*32+16]
 		m1 := encodedOT[i*32+16 : i*32+32]
-		if bitsArr[i] == 0 {
+		if choiceBits[i] == 0 {
 			decodedArr[i] = u.XorBytes(m0, mask)
 		} else {
 			decodedArr[i] = u.XorBytes(m1, mask)
 		}
 	}
-	o.receivedSoFar += len(bitsArr)
+	o.receivedSoFar += len(choiceBits)
 	o.expectingResponseSize = 0
 	return u.Concat(decodedArr...)
 }

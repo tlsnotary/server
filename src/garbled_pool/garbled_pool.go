@@ -1,35 +1,45 @@
 package garbled_pool
 
 import (
-	"encoding/binary"
 	"io/ioutil"
 	"log"
 	"notary/garbler"
+	"notary/meta"
 	u "notary/utils"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // gc describes a garbled circuit file
 // id is the name of the file
-// keyIdx is the index of a key in g.key used to encrypt the gc
+// keyIdx is the index of a key in g.keys used to encrypt this gc
 type gc struct {
 	id     string
 	keyIdx int
 }
 
+// Blob is what is returned when gc is read from disk
+type Blob struct {
+	Il *[]byte
+	// we dont return bytes of tt and dt because we gonna be streaming the file
+	// directly into the HTTP response to save memory
+	TtFile *os.File
+	DtFile *os.File
+}
+
 type GarbledPool struct {
 	// gPDirPath is full path to the garbled pool dir
 	gPDirPath string
-	// AES-GCM keys to encrypt/authenticate garbled circuits
-	// we need to encrypt them in case we want to store them outside the enclave
-	// when the encryption key changes, older keys are kept because we still
-	// have gc on disk encrypted with old keys
-	// keysCleanup sets old keys which are not used anymore to nil, thus releasing
-	// the memory
+	// AES-GCM keys to encrypt/authenticate circuits' labels.
+	// We need to encrypt them in case we want to store them outside the enclave.
+	// When the encryption key changes, older keys are kept because we still
+	// have labels on disk encrypted with old keys.
+	// monitor() sets old keys which are not used anymore to nil, thus releasing
+	// the memory.
 	keys [][]byte
 	// key is the current key in use. It is always keys[len(keys)-1]
 	key []byte
@@ -38,23 +48,16 @@ type GarbledPool struct {
 	encryptedSoFar int
 	// we change key after rekeyAfter bytes were encrypted
 	rekeyAfter int
-	// c5 subdirs' names are "50, 100, 150 ..." indicating how many garblings of
-	// a circuit there are in the dir
-	c5subdirs []string
-	// pool contains all non-c5 circuits
+	// pool contains metadata of all circuits. key is circuit number.
 	pool map[string][]gc
-	// poolc5 is like pool except map's <key> is one of g.c5subdirs and gc.id
-	// is a dir containing <key> amount of garblings
-	poolc5 map[string][]gc
 	// poolSize is how many concurrent TLSNotary sessions we want to support
 	// the server will maintain a pool of garbled circuits depending on this value
 	// the amount of c5 circuits will be poolSize*100 because on average one
 	// session needs that many garbled c5 circuits
 	poolSize int
-	Circuits []*garbler.Circuit
+	// Circuits's count starts from 1
+	Circuits []*meta.Circuit
 	grb      garbler.Garbler
-	// all circuits, count starts with 1 to avoid confusion
-	Cs []garbler.CData
 	// noSandbox is set to true when not running in a sandboxed environment
 	noSandbox bool
 	sync.Mutex
@@ -65,29 +68,22 @@ func (g *GarbledPool) Init(noSandbox bool) {
 	g.encryptedSoFar = 0
 	g.rekeyAfter = 1024 * 1024 * 1024 * 64 // 64GB
 	g.poolSize = 1
-	g.pool = make(map[string][]gc, 6)
-	for _, v := range []string{"1", "2", "3", "4", "5", "6"} {
+	g.pool = make(map[string][]gc, 7)
+	for _, v := range []string{"1", "2", "3", "4", "5", "6", "7"} {
 		g.pool[v] = []gc{}
 	}
-	g.Circuits = make([]*garbler.Circuit, 7)
-	for _, idx := range []int{1, 2, 3, 4, 5, 6} {
-		g.Circuits[idx] = g.grb.ParseCircuit(idx)
+	g.Circuits = make([]*meta.Circuit, 8)
+	for _, idx := range []int{1, 2, 3, 4, 5, 6, 7} {
+		g.Circuits[idx] = g.parseCircuit(idx)
+		g.Circuits[idx].OutputsSizes = meta.GetOutputSizes(idx)
 	}
-	g.Cs = make([]garbler.CData, 7)
-	g.Cs[1].Init(512, 512, 512)
-	g.Cs[2].Init(512, 640, 512)
-	g.Cs[3].Init(832, 1568, 800)
-	g.Cs[4].Init(672, 960, 480)
-	g.Cs[5].Init(160, 308, 128)
-	g.Cs[6].Init(288, 304, 128)
 	curDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
 		panic(err)
 	}
 	g.gPDirPath = filepath.Join(filepath.Dir(curDir), "garbledPool")
-	if g.noSandbox {
-		g.key = []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6}
-	} else {
+	if !g.noSandbox {
+		// running in an enclave, need to encrypt input labels
 		g.key = u.GetRandom(16)
 	}
 	g.keys = append(g.keys, g.key)
@@ -98,7 +94,7 @@ func (g *GarbledPool) Init(noSandbox bool) {
 		if err != nil {
 			panic(err)
 		}
-		for _, idx := range []string{"1", "2", "3", "4", "5", "6"} {
+		for _, idx := range []string{"1", "2", "3", "4", "5", "6", "7"} {
 			err = os.Mkdir(filepath.Join(g.gPDirPath, "c"+idx), 0755)
 			if err != nil {
 				panic(err)
@@ -115,19 +111,19 @@ func (g *GarbledPool) Init(noSandbox bool) {
 	go g.monitor()
 }
 
-// returns Blobs struct for each circuit
-func (g *GarbledPool) GetBlobs(c5Count int) []garbler.Blobs {
-	if c5Count > 1026 {
-		panic("c5Count > 1026")
+// returns 1 garbling of each circuit and c5Count garblings for circuit 5
+func (g *GarbledPool) GetBlobs(c6Count int) []Blob {
+	if c6Count > 1026 {
+		panic("c6Count > 1026")
 	}
-	allBlobs := make([]garbler.Blobs, len(g.Cs))
+	var allBlobs []Blob
 
 	// fetch blobs
-	for i := 1; i < len(allBlobs); i++ {
+	for i := 1; i < len(g.Circuits); i++ {
 		iStr := strconv.Itoa(i)
 		var count int
-		if i == 5 {
-			count = c5Count
+		if i == 6 {
+			count = c6Count
 		} else {
 			count = 1
 		}
@@ -144,52 +140,28 @@ func (g *GarbledPool) GetBlobs(c5Count int) []garbler.Blobs {
 			g.pool[iStr] = g.pool[iStr][1:]
 			g.Unlock()
 			blob := g.fetchBlob(iStr, gc)
-			il, tt, ol := g.deBlob(blob)
-			allBlobs[i].Il = append(allBlobs[i].Il, il...)
-			allBlobs[i].Tt = append(allBlobs[i].Tt, tt...)
-			allBlobs[i].Ol = append(allBlobs[i].Ol, ol...)
+			allBlobs = append(allBlobs, blob)
 		}
 	}
 	return allBlobs
 }
 
 func (g *GarbledPool) loadPoolFromDisk() {
-	for _, idx := range []string{"1", "2", "3", "4", "5", "6"} {
+	for _, idx := range []string{"1", "2", "3", "4", "5", "6", "7"} {
 		files, err := ioutil.ReadDir(filepath.Join(g.gPDirPath, "c"+idx))
 		if err != nil {
 			panic(err)
 		}
 		var gcs []gc
 		for _, file := range files {
-			gcs = append(gcs, gc{id: file.Name(), keyIdx: 0})
+			if strings.HasSuffix(file.Name(), "_il") {
+				nameNoSuffix := strings.Split(file.Name(), "_")[0]
+				gcs = append(gcs, gc{id: nameNoSuffix, keyIdx: 0})
+			}
 		}
 		g.pool[idx] = gcs
 		log.Println("loaded ", len(g.pool[idx]), " garbled circuits for circuit ", idx)
 	}
-}
-
-// garbles a circuit and returns a blob
-func (g *GarbledPool) garbleCircuit(cNo int) []byte {
-	tt, il, ol, _ := g.grb.OfflinePhase(g.grb.ParseCircuit(cNo), nil, nil, nil)
-	return g.makeBlob(il, tt, ol)
-}
-
-// garbles a batch of count c5 circuits and return the garbled blobs
-func (g *GarbledPool) garbleC5Circuits(count int) [][]byte {
-	var blobs [][]byte
-	tt, il, ol, R := g.grb.OfflinePhase(g.Circuits[5], nil, nil, nil)
-	labels := g.grb.SeparateLabels(il, g.Cs[5])
-	blobs = append(blobs, g.makeBlob(il, tt, ol))
-
-	// for all other circuits we only need ClientFixed input labels
-	ilReused := u.Concat(labels.NotaryFixed, labels.ClientNonFixed)
-	reuseIndexes := u.ExpandRange(0, 320)
-	for i := 2; i <= count; i++ {
-		tt, il, ol, _ := g.grb.OfflinePhase(g.Circuits[5], R, ilReused, reuseIndexes)
-		labels := g.grb.SeparateLabels(il, g.Cs[5])
-		blobs = append(blobs, g.makeBlob(labels.ClientFixed, tt, ol))
-	}
-	return blobs
 }
 
 // monitor replenishes the garbled pool when needed
@@ -230,7 +202,7 @@ func (g *GarbledPool) monitor() {
 		var k string
 		var v []gc
 		for k, v = range g.pool {
-			if k != "5" {
+			if k != "6" {
 				if len(v) >= g.poolSize {
 					continue
 				} else {
@@ -238,7 +210,8 @@ func (g *GarbledPool) monitor() {
 					break
 				}
 			} else {
-				// we need at least 1026 garblings for a max TLS record size
+				// for circuit 6 we need at least 1026 garblings for a max possible
+				// TLS record size of 16KB
 				max := u.Max(g.poolSize*100, 1026)
 				if len(v) >= max {
 					continue
@@ -249,15 +222,14 @@ func (g *GarbledPool) monitor() {
 			}
 		}
 		// golang doesnt allow to modify map while iterating it
-		// that's why we break the iteration
+		// that's why we broke the iteration and got here
 		if diff > 0 {
 			// need to replenish the pool
 			for i := 0; i < diff; i++ {
-				//log.Println("in monitorPool adding c", k)
 				kInt, _ := strconv.Atoi(k)
-				blob := g.garbleCircuit(kInt)
+				il, tt, dt := g.grb.Garble(g.Circuits[kInt])
 				randName := u.RandString()
-				g.saveBlob(filepath.Join(g.gPDirPath, "c"+k, randName), blob)
+				g.saveBlob(filepath.Join(g.gPDirPath, "c"+k, randName), il, tt, dt)
 				g.Lock()
 				g.pool[k] = append(g.pool[k], gc{id: randName, keyIdx: len(g.keys) - 1})
 				g.Unlock()
@@ -270,87 +242,115 @@ func (g *GarbledPool) monitor() {
 	}
 }
 
-// packs data into a blob with length prefixes
-func (g *GarbledPool) makeBlob(il []byte, tt *[]byte, ol []byte) []byte {
-	ilSize := make([]byte, 4)
-	binary.BigEndian.PutUint32(ilSize, uint32(len(il)))
-	ttSize := make([]byte, 4)
-	binary.BigEndian.PutUint32(ttSize, uint32(len(*tt)))
-	olSize := make([]byte, 4)
-	binary.BigEndian.PutUint32(olSize, uint32(len(ol)))
-	return u.Concat(ilSize, il, ttSize, *tt, olSize, ol)
-}
-
-func (g *GarbledPool) deBlob(blob []byte) ([]byte, []byte, []byte) {
-	offset := 0
-	ilSize := int(binary.BigEndian.Uint32(blob[offset : offset+4]))
-	offset += 4
-	il := blob[offset : offset+ilSize]
-	offset += ilSize
-	ttSize := int(binary.BigEndian.Uint32(blob[offset : offset+4]))
-	offset += 4
-	tt := blob[offset : offset+ttSize]
-	offset += ttSize
-	olSize := int(binary.BigEndian.Uint32(blob[offset : offset+4]))
-	offset += 4
-	ol := blob[offset : offset+olSize]
-	return il, tt, ol
-}
-
-func (g *GarbledPool) saveBlob(path string, blob []byte) {
-	enc := u.AESGCMencrypt(g.key, blob)
-	g.encryptedSoFar += len(blob)
-	err := os.WriteFile(path, enc, 0644)
+func (g *GarbledPool) saveBlob(path string, il *[]byte, tt *[]byte, dt *[]byte) {
+	var ilToWrite *[]byte
+	// we only encrypt input labels
+	if !g.noSandbox {
+		ilEnc := u.AESGCMencrypt(g.key, *il)
+		ilToWrite = &ilEnc
+	} else {
+		ilToWrite = il
+	}
+	err := os.WriteFile(path+"_il", *ilToWrite, 0644)
+	if err != nil {
+		panic(err)
+	}
+	err = os.WriteFile(path+"_tt", *tt, 0644)
+	if err != nil {
+		panic(err)
+	}
+	err = os.WriteFile(path+"_dt", *dt, 0644)
 	if err != nil {
 		panic(err)
 	}
 }
 
 // fetches the blob from disk and deletes it
-func (g *GarbledPool) fetchBlob(circuitNo string, c gc) []byte {
+func (g *GarbledPool) fetchBlob(circuitNo string, c gc) Blob {
 	fullPath := filepath.Join(g.gPDirPath, "c"+circuitNo, c.id)
-	data, err := os.ReadFile(fullPath)
+	il, err := os.ReadFile(fullPath + "_il")
 	if err != nil {
 		panic(err)
 	}
-	err = os.Remove(fullPath)
+	err = os.Remove(fullPath + "_il")
 	if err != nil {
 		panic(err)
 	}
-	return u.AESGCMdecrypt(g.keys[c.keyIdx], data)
+	// only the file handle of truth tables and decoding tables is returned,
+	// so that the file could be streamed (avoiding a full copy into memory)
+	// The session which receives this handle will be responsible for
+	// deleting the file
+	ttFile, err3 := os.Open(fullPath + "_tt")
+	if err3 != nil {
+		panic(err3)
+	}
+	dtFile, err4 := os.Open(fullPath + "_dt")
+	if err4 != nil {
+		panic(err4)
+	}
+	var ilToReturn = &il
+	if !g.noSandbox {
+		// decrypt data from disk when in a sandbox
+		ilDec := u.AESGCMdecrypt(g.keys[c.keyIdx], il)
+		ilToReturn = &ilDec
+	}
+	return Blob{ilToReturn, ttFile, dtFile}
 }
 
-// fetches count blobs from folder and then removes it
-func (g *GarbledPool) fetchC5Blobs(subdir string, c gc, count int) [][]byte {
-	var rawBlobs [][]byte
-	dirPath := filepath.Join(g.gPDirPath, "c5", subdir, c.id)
-	for i := 0; i < count; i++ {
-		iStr := strconv.Itoa(i + 1)
-		data, err := os.ReadFile(filepath.Join(dirPath, iStr))
-		if err != nil {
-			panic(err)
-		}
-		rawBlobs = append(rawBlobs, u.AESGCMdecrypt(g.keys[c.keyIdx], data))
-	}
-	err := os.RemoveAll(dirPath)
+// Convert the circuits from the "Bristol fashion" format into a compact
+// binary representation which can be loaded into RAM and processed gate-by-gate
+func (g *GarbledPool) parseCircuit(cNo_ int) *meta.Circuit {
+	cNo := strconv.Itoa(cNo_)
+	curDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
 		panic(err)
 	}
-	return rawBlobs
-}
+	baseDir := filepath.Dir(curDir)
+	jiggDir := filepath.Join(baseDir, "circuits")
+	cBytes, err := ioutil.ReadFile(filepath.Join(jiggDir, "c"+cNo+".out"))
+	if err != nil {
+		panic(err)
+	}
+	text := string(cBytes)
+	lines := strings.Split(text, "\n")
+	c := meta.Circuit{}
+	wireCount, _ := strconv.ParseInt(strings.Split(lines[0], " ")[1], 10, 32)
+	gi, _ := strconv.ParseInt(strings.Split(lines[1], " ")[1], 10, 32)
+	ei, _ := strconv.ParseInt(strings.Split(lines[1], " ")[2], 10, 32)
+	out, _ := strconv.ParseInt(strings.Split(lines[2], " ")[1], 10, 32)
 
-func (g *GarbledPool) saveC5Blobs(path string, blobs [][]byte) {
-	err := os.Mkdir(path, 0755)
-	if err != nil {
-		panic(err)
-	}
-	for i := 0; i < len(blobs); i++ {
-		fileName := strconv.Itoa(i + 1)
-		enc := u.AESGCMencrypt(g.key, blobs[i])
-		g.encryptedSoFar += len(blobs[i])
-		err := os.WriteFile(filepath.Join(path, fileName), enc, 0644)
-		if err != nil {
-			panic(err)
+	c.WireCount = int(wireCount)
+	c.NotaryInputSize = int(gi)
+	c.ClientInputSize = int(ei)
+	c.OutputSize = int(out)
+
+	gates := make([]meta.Gate, len(lines)-3)
+	andGateCount := 0
+	opBytes := map[string]byte{"XOR": 0, "AND": 1, "INV": 2}
+
+	for i, line := range lines[3:] {
+		items := strings.Split(line, " ")
+		var g meta.Gate
+		g.Operation = opBytes[items[len(items)-1]]
+		g.Id = uint32(i)
+		if g.Operation == 0 || g.Operation == 1 {
+			inp1, _ := strconv.ParseInt(items[2], 10, 32)
+			inp2, _ := strconv.ParseInt(items[3], 10, 32)
+			out, _ := strconv.ParseInt(items[4], 10, 32)
+			g.InputWires = []uint32{uint32(inp1), uint32(inp2)}
+			g.OutputWire = uint32(out)
+			if g.Operation == 1 {
+				andGateCount += 1
+			}
+		} else { // INV gate
+			inp1, _ := strconv.ParseInt(items[2], 10, 32)
+			out, _ := strconv.ParseInt(items[3], 10, 32)
+			g.InputWires = []uint32{uint32(inp1)}
+			g.OutputWire = uint32(out)
 		}
+		gates[i] = g
 	}
+	c.Gates = gates
+	c.AndGateCount = int(andGateCount)
+	return &c
 }

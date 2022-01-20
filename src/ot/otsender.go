@@ -8,6 +8,8 @@ import (
 	"github.com/bwesterb/go-ristretto"
 )
 
+// OTSender implements the sender of the Oblivious Transfer acc.to.
+// the KOS15 protocol
 type OTSender struct {
 	extraOT   int
 	otCount   int
@@ -38,7 +40,7 @@ func (o *OTSender) SetupStep1(A_, hisCommit []byte) ([]byte, []byte) {
 	}
 	o.hisCommit = hisCommit
 	o.seedShare = u.GetRandom(16)
-	// Alice computes her Bs and decryption keys based on each bit in S
+	// compute Bs and decryption keys of the base OT for each bit in S
 	o.s = u.GetRandom(16)
 	o.sBits = u.Reverse(u.BytesToBits(o.s))
 	allBs := make([][]byte, len(o.sBits))
@@ -112,19 +114,21 @@ func (o *OTSender) SetupStep2(encryptedColumnsBlob, receiverSeedShare, x, t []by
 	o.rQ1 = breakCorrelation(Q1[0 : len(Q1)-o.extraOT])
 	// now we have instances of Random OT where depending on r's bit,
 	// each row in RT0 equals to a row either in RQ0 or RQ1
-	log.Println("done 2")
-	// in Steps 5,6,7 we will use Beaver Derandomization to convert
+
+	// when processing OT request, we will use Beaver Derandomization to convert
 	// randomOT into standardOT
 }
 
-// Step 6
-// for every bit in bitsToFlip, the Sender has two 16-byte messages for 1-of-2 OT and
-// two random masks (from the KOS15 protocol) r0 and r1
-// if the bit is 0, the Sender sends (m0 xor r0) and (m1 xor r1),
-// if the bit is 1, the Sender sends (m0 xor r1) and (m1 xor r0)
-func (o *OTSender) GetMaskedOT(bitsBlob, messages []byte) []byte {
-	dropCount := int(bitsBlob[0])
-	bitsToFlipWithRem := u.BytesToBits(bitsBlob[1:])
+// ProcessRequest processes a request for OT from the OT receiver.
+// otRequest contains bits which need to be flipped acc.to the Beaver derandomiation
+// method. The Sender has two 16-byte messages for 1-of-2 OT and
+// two random masks (from the KOS15 protocol) r0 and r1.
+// If the bit to flip is 0, the Sender sends (m0 xor r0) and (m1 xor r1).
+// If the bit to flip is 1, the Sender sends (m0 xor r1) and (m1 xor r0).
+// Returns an OT response.
+func (o *OTSender) ProcessRequest(otRequest, messages []byte) []byte {
+	dropCount := int(otRequest[0])
+	bitsToFlipWithRem := u.BytesToBits(otRequest[1:])
 	bitsToFlip := bitsToFlipWithRem[:len(bitsToFlipWithRem)-dropCount]
 	if o.sentSoFar+len(bitsToFlip) > o.otCount {
 		panic("o.sentSoFar + len(bitsToFlip) > o.otCount")

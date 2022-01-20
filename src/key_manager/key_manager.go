@@ -13,6 +13,12 @@ import (
 	"time"
 )
 
+// KeyManager generates an ephemeral used by notary to sign the session and also
+// to derive symmetric keys for client<->notary communication.
+// The client only accepts notarization sessions signed by an eph.key whose validity
+// interval corresponds to the timestamp of the session.
+// We start generating a new eph.key a few minute before the previous key is set to expire.
+
 type KeyManager struct {
 	sync.Mutex
 	// Blob contains validFrom|validUntil|pubkey|signature
@@ -34,6 +40,8 @@ func (k *KeyManager) Init() {
 	go k.rotateEphemeralKeys()
 }
 
+// generateMasterKey generates a P-256 master key. The corresponding public key
+// in PEM format is written to disk
 func (k *KeyManager) generateMasterKey() {
 	// masterKey is only used to sign ephemeral keys
 	var err error
@@ -56,10 +64,13 @@ func (k *KeyManager) generateMasterKey() {
 // sign it with the master key
 func (k *KeyManager) rotateEphemeralKeys() {
 	k.validMins = 20
+	// initially setting to zero to immediately trigger a key rotation
 	nextKeyRotationTime := time.Unix(0, 0)
 	for {
 		time.Sleep(time.Second * 1)
 		now := time.Now()
+		// start key rotation no sooner than 2 mins before the current eph. key
+		// is set to expire
 		if nextKeyRotationTime.Sub(now) > time.Minute*2 {
 			continue
 		}

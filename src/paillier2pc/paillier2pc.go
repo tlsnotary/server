@@ -14,14 +14,21 @@ import (
 
 // Protocol to compute EC point addition in Paillier as described here:
 // https://tlsnotary.org/how_it_works#section1
-// The code uses the same notation as in the link above.
+// The code uses the same notation as in the link above. The code must be read
+// alongside the writeup.
 
 // Paillier2PC implements the notary's side of computing an EC point
 // addition in 2PC
 type Paillier2PC struct {
-	p256                  ec.Curve
-	d_n, Q_nx, Q_ny       *big.Int
-	paillierPrivKey       *paillier.PrivateKey
+	p256 ec.Curve
+	// d_n is notary's share of the EC private key
+	d_n *big.Int
+	// Q_nx, Q_ny are notary's shares of the EC public key
+	Q_nx, Q_ny *big.Int
+	// paillierPrivKey is used to decrypt 2PC messages from client
+	// it also contains a public key used to encrypt 2PC message to the client
+	paillierPrivKey *paillier.PrivateKey
+	// constant numbers
 	Zero, One, Two, Three *big.Int
 	// P is curve P-256's Field prime
 	P *big.Int
@@ -141,6 +148,7 @@ func (p *Paillier2PC) Step3(payload []byte) []byte {
 	return []byte(json)
 }
 
+// final step
 func (p *Paillier2PC) Step4(payload []byte) []byte {
 	type Step4 struct {
 		E135 string

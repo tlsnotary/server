@@ -8,7 +8,7 @@ It is primarily intended to be run inside a sandboxed AWS EC2 instance (https://
 git clone --recurse-submodules https://github.com/tlsnotary/server
 
 3. Compile:
-cd server
+cd server/src
 go mod init notary
 go get github.com/bwesterb/go-ristretto@b51b4774df9150ea7d7616f76e77f745a464bbe3
 go get github.com/roasbeef/go-go-gadget-paillier@14f1f86b60008ece97b6233ed246373e555fc79f

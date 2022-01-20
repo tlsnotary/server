@@ -39,6 +39,12 @@ func SplitIntoChunks(data []byte, chunkSize int) [][]byte {
 	return chunks
 }
 
+func Assert(condition bool) {
+	if !condition {
+		panic("assert failed")
+	}
+}
+
 // port of sodium.crypto_generichash
 func Generichash(length int, msg []byte) []byte {
 	h, err := blake2b.New(length, nil)
@@ -144,7 +150,7 @@ func BytesToBits(b []byte) []int {
 	return bits
 }
 
-// convert an array of 0/1 into bytes
+// convert an array of 0/1 with least bit at index 0 into bytes
 func BitsToBytes(b []int) []byte {
 	bigint := new(big.Int)
 	for i := 0; i < len(b); i++ {
@@ -182,9 +188,24 @@ func Concat(slices ...[]byte) []byte {
 	return newSlice
 }
 
+// concatenate slices of bytes pointed to by pointers into a new slice with
+// a new underlying array
+func ConcatP(pointers ...*[]byte) []byte {
+	totalSize := 0
+	for _, v := range pointers {
+		totalSize += len(*v)
+	}
+	newSlice := make([]byte, totalSize)
+	copiedSoFar := 0
+	for _, v := range pointers {
+		copy(newSlice[copiedSoFar:copiedSoFar+len(*v)], *v)
+		copiedSoFar += len(*v)
+	}
+	return newSlice
+}
+
 // finishes sha256 hash from a previous mid-state
 func FinishHash(outerState []byte, data []byte) []byte {
-
 	digest := sha256.New()
 	digestUnmarshaler, ok := digest.(encoding.BinaryUnmarshaler)
 	if !ok {
@@ -207,105 +228,7 @@ func FinishHash(outerState []byte, data []byte) []byte {
 	return digest.Sum(nil)
 }
 
-// GF block multiplication
-func BlockMultOld(val, encZero *big.Int) *big.Int {
-	res := big.NewInt(0)
-	_255 := big.NewInt(255)
-	R, ok := new(big.Int).SetString("E1000000000000000000000000000000", 16)
-	if !ok {
-		panic("SetString")
-	}
-	j := new(big.Int)
-	for i := 0; i < 16; i++ {
-		j.And(val, _255)
-		j.Lsh(j, uint(8*i))
-		res.Xor(res, gf_2_128_mul(encZero, j, R))
-		val.Rsh(val, 8) // val >>= 8n
-	}
-	return res
-}
-
-// Galois field multiplication of two 128-bit blocks reduced by the GCM polynomial
-func BlockMult(x_, y_ []byte) []byte {
-	x := new(big.Int).SetBytes(x_)
-	y := new(big.Int).SetBytes(y_)
-	res := big.NewInt(0)
-	_1 := big.NewInt(1)
-	R, ok := new(big.Int).SetString("E1000000000000000000000000000000", 16)
-	if !ok {
-		panic("SetString")
-	}
-	for i := 127; i >= 0; i-- {
-		tmp1 := new(big.Int).Rsh(y, uint(i))
-		tmp2 := new(big.Int).And(tmp1, _1)
-		res.Xor(res, new(big.Int).Mul(x, tmp2))
-		tmp3 := new(big.Int).And(x, _1)
-		tmp4 := new(big.Int).Mul(tmp3, R)
-		tmp5 := new(big.Int).Rsh(x, 1)
-		x = new(big.Int).Xor(tmp5, tmp4)
-	}
-	return To16Bytes(res)
-}
-
-// return a table of byte values of x after each of the 128 rounds of BlockMult
-func GetXTable(xBytes []byte) [][]byte {
-	x := new(big.Int).SetBytes(xBytes)
-	_1 := big.NewInt(1)
-	R, ok := new(big.Int).SetString("E1000000000000000000000000000000", 16)
-	if !ok {
-		panic("SetString")
-	}
-	xTable := make([][]byte, 128)
-	for i := 0; i < 128; i++ {
-		xTable[i] = To16Bytes(x)
-		tmp3 := new(big.Int).And(x, _1)
-		tmp4 := new(big.Int).Mul(tmp3, R)
-		tmp5 := new(big.Int).Rsh(x, 1)
-		x = new(big.Int).Xor(tmp5, tmp4)
-	}
-	return xTable
-}
-
-func FindSum(powersOfH *[][]byte, sum int) (int, int) {
-	for i := 0; i < len(*powersOfH); i++ {
-		if (*powersOfH)[i] == nil {
-			continue
-		}
-		for j := 0; j < len(*powersOfH); j++ {
-			if (*powersOfH)[j] == nil {
-				continue
-			}
-			if i+j == sum {
-				return i, j
-			}
-		}
-	}
-	// this should never happen because we always call
-	// findSum() knowing that the sum can be found
-	panic("sum not found")
-}
-
-// returns modified powersOfH
-func FreeSquare(powersOfH *[][]byte, maxPowerNeeded int) {
-	for i := 0; i < len(*powersOfH); i++ {
-		if (*powersOfH)[i] == nil || i%2 == 0 {
-			continue
-		}
-		if i > maxPowerNeeded {
-			return
-		}
-		power := i
-		for power < maxPowerNeeded {
-			power = power * 2
-			if (*powersOfH)[power] != nil {
-				continue
-			}
-			prevPower := (*powersOfH)[power/2]
-			(*powersOfH)[power] = BlockMult(prevPower, prevPower)
-		}
-	}
-}
-
+// GetRandom returns a random slice of specified size
 func GetRandom(size int) []byte {
 	randomBytes := make([]byte, size)
 	_, err := rand.Read(randomBytes)
