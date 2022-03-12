@@ -67,49 +67,43 @@ func destroyOnPanic(s *session.Session) {
 	s.DestroyChan <- s.Sid
 }
 
-func init1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in init1", req.RemoteAddr)
-	s := sm.AddSession(string(req.URL.RawQuery))
+func httpHandler(w http.ResponseWriter, req *http.Request) {
+	// sessionId is the part of the URL after ?
+	sessionId := string(req.URL.RawQuery)
+	// command is URL path without the leading /
+	command := req.URL.Path[1:]
+	log.Println("got request ", command, " from ", req.RemoteAddr)
+	var out []byte
+	if command == "init1" {
+		s := sm.AddSession(sessionId)
+		s.Gp = gp
+		key, keyData := km.GetActiveKey()
+		s.SigningKey = key
+		// keyData is sent to Client unencrypted
+		out = append(out, keyData...)
+	}
+	s := sm.GetSession(sessionId)
 	defer destroyOnPanic(s)
+	method := sm.GetMethod(command, sessionId)
 	body := readBody(req)
-	s.Gp = gp
-	// copying data so that it doesn't change from under us if
-	// ephemeral key happens to change while this session is running
-	km.Lock()
-	blob := make([]byte, len(km.Blob))
-	copy(blob, km.Blob)
-	key := *km.PrivKey
-	km.Unlock()
-	out := s.Init1(body, blob, key)
+	out = append(out, method(body)...)
 	writeResponse(out, w)
+	if command == "commitHash" {
+		// this was the final message of the session. Destroying the session...
+		s.DestroyChan <- s.Sid
+	}
 }
 
-func init2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in init2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Init2(body)
-	writeResponse(out, w)
-}
-
+// getBlob is called when user wants to download garbled circuits
 func getBlob(w http.ResponseWriter, req *http.Request) {
 	log.Println("in getBlob", req.RemoteAddr)
 	s := sm.GetSession(string(req.URL.RawQuery))
 	defer destroyOnPanic(s)
 	body := readBody(req)
-	tt, dt := s.GetBlob(body)
-	// send headers first
+	fileHandles := s.GetBlob(body)
 	writeResponse(nil, w)
-	// stream decoding table directly from file
-	for _, f := range dt {
-		_, err := io.Copy(w, f)
-		if err != nil {
-			panic("err != nil")
-		}
-	}
-	// stream decoding table directly from file
-	for _, f := range tt {
+	// stream directly from file
+	for _, f := range fileHandles {
 		_, err := io.Copy(w, f)
 		if err != nil {
 			panic("err != nil")
@@ -117,6 +111,7 @@ func getBlob(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// setBlob is called when user wants to upload garbled circuits
 func setBlob(w http.ResponseWriter, req *http.Request) {
 	log.Println("in setBlob", req.RemoteAddr)
 	s := sm.GetSession(string(req.URL.RawQuery))
@@ -125,298 +120,9 @@ func setBlob(w http.ResponseWriter, req *http.Request) {
 	writeResponse(out, w)
 }
 
-func getUploadProgress(w http.ResponseWriter, req *http.Request) {
-	log.Println("in getUploadProgress", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	out := s.GetUploadProgress()
-	writeResponse(out, w)
-}
-
-func step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Step1(body)
-	writeResponse(out, w)
-}
-
-func step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Step2(body)
-	writeResponse(out, w)
-}
-
-func step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Step3(body)
-	writeResponse(out, w)
-}
-
-func step4(w http.ResponseWriter, req *http.Request) {
-	log.Println("in step4", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Step4(body)
-	writeResponse(out, w)
-}
-
-func c1_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c1_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C1_step1(body)
-	writeResponse(out, w)
-}
-
-func c1_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c1_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C1_step2(body)
-	writeResponse(out, w)
-}
-
-func c1_step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c1_step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C1_step3(body)
-	writeResponse(out, w)
-}
-
-func c1_step4(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c1_step4", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C1_step4(body)
-	writeResponse(out, w)
-}
-
-func c1_step5(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c1_step5", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C1_step5(body)
-	writeResponse(out, w)
-}
-
-func c2_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c2_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C2_step1(body)
-	writeResponse(out, w)
-}
-
-func c2_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c2_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C2_step2(body)
-	writeResponse(out, w)
-}
-
-func c2_step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c2_step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C2_step3(body)
-	writeResponse(out, w)
-}
-
-func c2_step4(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c2_step4", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C2_step4(body)
-	writeResponse(out, w)
-}
-
-func c3_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c3_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C3_step1(body)
-	writeResponse(out, w)
-}
-
-func c3_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c3_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C3_step2(body)
-	writeResponse(out, w)
-}
-
-func c4_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c4_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C4_step1(body)
-	writeResponse(out, w)
-}
-
-func c4_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c4_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C4_step2(body)
-	writeResponse(out, w)
-}
-
-func c4_step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c4_step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C4_step3(body)
-	writeResponse(out, w)
-}
-
-func c5_pre1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c5_pre1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C5_pre1(body)
-	writeResponse(out, w)
-}
-
-func c5_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c5_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C5_step1(body)
-	writeResponse(out, w)
-}
-
-func c5_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c5_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C5_step2(body)
-	writeResponse(out, w)
-}
-
-func c5_step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c5_step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C5_step3(body)
-	writeResponse(out, w)
-}
-
-func c6_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c6_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C6_step1(body)
-	writeResponse(out, w)
-}
-
-func c6_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c6_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C6_step2(body)
-	writeResponse(out, w)
-}
-
-func c7_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c7_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C7_step1(body)
-	writeResponse(out, w)
-}
-
-func c7_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in c7_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.C7_step2(body)
-	writeResponse(out, w)
-}
-
-func checkC7Commit(w http.ResponseWriter, req *http.Request) {
-	log.Println("in checkC7Commit", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.CheckC7Commit(body)
-	writeResponse(out, w)
-}
-
-func ghash_step1(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step1", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Ghash_step1(body)
-	writeResponse(out, w)
-}
-
-func ghash_step2(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step2", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Ghash_step2(body)
-	writeResponse(out, w)
-}
-
-func ghash_step3(w http.ResponseWriter, req *http.Request) {
-	log.Println("in ghash_step3", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.Ghash_step3(body)
-	writeResponse(out, w)
-}
-
-func commitHash(w http.ResponseWriter, req *http.Request) {
-	log.Println("in commitHash", req.RemoteAddr)
-	s := sm.GetSession(string(req.URL.RawQuery))
-	defer destroyOnPanic(s)
-	body := readBody(req)
-	out := s.CommitHash(body)
-	writeResponse(out, w)
-	s.DestroyChan <- s.Sid
-}
-
 // when notary starts we expect the admin to upload a URLFetcher document
 // it can be uploaded e.g. with:
 // curl --data-binary '@URLFetcherDoc' 127.0.0.1:10012/setURLFetcherDoc
-
 func awaitURLFetcherDoc() {
 	serverMux := http.NewServeMux()
 	srv := &http.Server{Addr: ":10012", Handler: serverMux}
@@ -443,7 +149,7 @@ func getPubKey(w http.ResponseWriter, req *http.Request) {
 }
 
 // initially the circuits are in the human-readable c*.casm format; assemble.js
-// converts them into a "Bristol fashion" format and write to disk c*.out files
+// converts them into a "Bristol fashion" format and writes to disk c*.out files
 func assembleCircuits() {
 	curDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
 	baseDir := filepath.Dir(curDir)
@@ -457,11 +163,16 @@ func assembleCircuits() {
 			log.Println("Error. Could not run: node assemble.js. Please make sure that node is installed on your system.")
 			os.Exit(1)
 		}
+		log.Println("Finished assembling circuits.")
 	}
 }
 
 func main() {
 	// uncomment the below to profile the process's RAM usage
+	// install with: go get github.com/pkg/profile
+	// then run: curl http://localhost:8080/debug/pprof/heap > heap
+	// go tool pprof -png heap
+
 	// defer profile.Start(profile.MemProfile).Stop()
 	// go func() {
 	// 	http.ListenAndServe(":8080", nil)
@@ -487,64 +198,11 @@ func main() {
 	// can be useful when debugging sandboxed notary
 	http.HandleFunc("/getPubKey", getPubKey)
 
-	http.HandleFunc("/init1", init1)
-	http.HandleFunc("/init2", init2)
 	http.HandleFunc("/getBlob", getBlob)
 	http.HandleFunc("/setBlob", setBlob)
-	http.HandleFunc("/getUploadProgress", getUploadProgress)
 
-	// step1 thru step4 deal with Paillier 2PC
-	http.HandleFunc("/step1", step1)
-	http.HandleFunc("/step2", step2)
-	http.HandleFunc("/step3", step3)
-	http.HandleFunc("/step4", step4)
-
-	// c1_step1 thru c1_step1 deal with TLS Handshake
-	http.HandleFunc("/c1_step1", c1_step1)
-	http.HandleFunc("/c1_step2", c1_step2)
-	http.HandleFunc("/c1_step3", c1_step3)
-	http.HandleFunc("/c1_step4", c1_step4)
-	http.HandleFunc("/c1_step5", c1_step5)
-
-	// c2_step1 thru c2_step4 deal with TLS Handshake
-	http.HandleFunc("/c2_step1", c2_step1)
-	http.HandleFunc("/c2_step2", c2_step2)
-	http.HandleFunc("/c2_step3", c2_step3)
-	http.HandleFunc("/c2_step4", c2_step4)
-
-	// c3_step1 thru c4_step3 deal with TLS Handshake and also prepare data
-	// needed to send Client Finished
-	http.HandleFunc("/c3_step1", c3_step1)
-	http.HandleFunc("/c3_step2", c3_step2)
-
-	http.HandleFunc("/c4_step1", c4_step1)
-	http.HandleFunc("/c4_step2", c4_step2)
-	http.HandleFunc("/c4_step3", c4_step3)
-
-	// c5_pre1 thru c5_step3 check Server Finished
-	http.HandleFunc("/c5_pre1", c5_pre1)
-	http.HandleFunc("/c5_step1", c5_step1)
-	http.HandleFunc("/c5_step2", c5_step2)
-	http.HandleFunc("/c5_step3", c5_step3)
-
-	// c6_step1 thru c6_step2 prepare encrypted counter blocks for the
-	// client's request to the webserver
-	http.HandleFunc("/c6_step1", c6_step1)
-	http.HandleFunc("/c6_step2", c6_step2)
-
-	// c7_step1 thru c7_step2 prepare the GCTR block needed to compute the MAC
-	// for the client's request
-	http.HandleFunc("/c7_step1", c7_step1)
-	http.HandleFunc("/c7_step2", c7_step2)
-	http.HandleFunc("/checkC7Commit", checkC7Commit)
-
-	// steps ghash_step1 thru ghash_step3 compute the GHASH output needed to
-	// compute the MAC for the client's request
-	http.HandleFunc("/ghash_step1", ghash_step1)
-	http.HandleFunc("/ghash_step2", ghash_step2)
-	http.HandleFunc("/ghash_step3", ghash_step3)
-
-	http.HandleFunc("/commitHash", commitHash)
+	// all the other request will end up in the httpHandler
+	http.HandleFunc("/", httpHandler)
 
 	http.ListenAndServe("0.0.0.0:10011", nil)
 }
