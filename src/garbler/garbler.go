@@ -16,34 +16,32 @@ type Garbler struct {
 	Cs []CData
 }
 
-// CData is circuit's data
+// CData is data for one circuit
 type CData struct {
-	Il []byte // input labels
-	// InputBits start with least input bit at index [0]
-	InputBits []int // notary's input for this circuit
-	Masks     [][]byte
-	Meta      *meta.Circuit
+	// Il contains a flat slice of all input labels for all executions of
+	// one circuit
+	Il []byte
+	// InputBits is notary's input for this circuit. Starts with the least
+	// input bit at index [0].
+	InputBits []int
+	// Masks are notary's masks. They are inputs to the circuit. Their purpose
+	// is to mask the circuit's output. Mask numbering starts with 1 for
+	// convenience. Consult circuits/*.casm files for description of what each
+	// mask does.
+	Masks [][]byte
+	Meta  *meta.Circuit
 }
 
 // Init puts input labels into correspondign circuits and creates masks for
 // notary's inputs to the circuits.
-// ilBlobs contains slices of input labels for each execution
-func (g *Garbler) Init(ilBlobs []*[]byte, circuits []*meta.Circuit, c6Count int) {
+// il contains input labels for each execution of each circuit
+func (g *Garbler) Init(il [][][]byte, circuits []*meta.Circuit, c6Count int) {
 	g.C6Count = c6Count
 	g.Cs = make([]CData, len(circuits))
 	for i := 1; i < len(g.Cs); i++ {
-		if i < 6 {
-			g.Cs[i].Il = *ilBlobs[i-1]
-		} else if i == 6 {
-			g.Cs[i].Il = u.ConcatP(ilBlobs[5 : 5+c6Count]...)
-		} else if i > 6 {
-			g.Cs[i].Il = *ilBlobs[c6Count-1+i-1]
-		}
-
+		g.Cs[i].Il = u.Concat(il[i]...)
 		g.Cs[i].Meta = circuits[i]
 
-		// mask numbering starts at 1 for convenience
-		// consult circuits/*.casm files for what each mask does
 		if i == 1 {
 			g.Cs[i].Masks = make([][]byte, 2)
 			g.Cs[i].Masks[1] = u.GetRandom(32)

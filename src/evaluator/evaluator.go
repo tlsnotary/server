@@ -1,7 +1,6 @@
 package evaluator
 
 import (
-	"math"
 	"notary/meta"
 	u "notary/utils"
 )
@@ -13,26 +12,22 @@ type Evaluator struct {
 	// they are meant to be read-only for evaluator
 	meta    []*meta.Circuit
 	ttBlobs [][]byte // truth table blobs for each circuit
-	olBlobs [][]byte // output labels blobs for each circuit
 }
 
 func (e *Evaluator) Init(circuits []*meta.Circuit, c6Count int) {
 	e.C6Count = c6Count
 	e.meta = circuits
 	e.ttBlobs = make([][]byte, len(e.meta))
-	e.olBlobs = make([][]byte, len(e.meta))
 }
 
 // Evaluate evaluates a circuit number cNo
 func (e *Evaluator) Evaluate(cNo int, notaryLabels, clientLabels,
-	truthTables, decodingTable []byte) []byte {
+	truthTables []byte) []byte {
 	type batch_t struct {
 		// wl is wire labels
 		wl *[][]byte
 		// tt is truth tables
 		tt *[]byte
-		// dt is decoding table
-		dt *[]byte
 	}
 
 	c := (e.meta)[cNo]
@@ -40,7 +35,6 @@ func (e *Evaluator) Evaluate(cNo int, notaryLabels, clientLabels,
 	nlBatch := u.SplitIntoChunks(notaryLabels, c.NotaryInputSize*16)
 	clBatch := u.SplitIntoChunks(clientLabels, c.ClientInputSize*16)
 	ttBatch := u.SplitIntoChunks(truthTables, c.AndGateCount*48)
-	dtBatch := u.SplitIntoChunks(decodingTable, int(math.Ceil(float64(c.OutputSize)/8)))
 
 	// exeCount is how many executions of this circuit we need
 	exeCount := []int{0, 1, 1, 1, 1, 1, e.C6Count, 1}[cNo]
@@ -49,41 +43,17 @@ func (e *Evaluator) Evaluate(cNo int, notaryLabels, clientLabels,
 		// put all input labels into wire labels
 		wireLabels := make([][]byte, c.WireCount)
 		copy(wireLabels, u.SplitIntoChunks(u.Concat(nlBatch[r], clBatch[r]), 16))
-		batch[r] = batch_t{&wireLabels, &ttBatch[r], &dtBatch[r]}
+		batch[r] = batch_t{&wireLabels, &ttBatch[r]}
 	}
 
-	var output []byte
+	encodedOutput := make([][]byte, exeCount)
 	for r := 0; r < exeCount; r++ {
-		plaintext := evaluate(c, batch[r].wl, batch[r].tt, batch[r].dt)
-		// plaintext has a padding in MSB to make it a multiple of 8 bits. We
-		// decompose into bits and drop the padding
-		outBits := u.BytesToBits(plaintext)[0:c.OutputSize]
-		// reverse output bits so that the values of the output be placed in
-		// the same order as they appear in the *.casm files
-		outBytes := e.parseOutputBits(cNo, outBits)
-		output = append(output, outBytes...)
+		encodedOutput[r] = evaluate(c, batch[r].wl, batch[r].tt)
 	}
-	return output
+	return u.Concat(encodedOutput...)
 }
 
-// parseOutputBits converts the output bits of the circuit into a flat slice
-// of bytes so that output values are in the same order as they appear in the *.casm files
-func (e *Evaluator) parseOutputBits(cNo int, outBits []int) []byte {
-	o := 0 // offset
-	var outBytes []byte
-	for _, v := range (e.meta)[cNo].OutputsSizes {
-		output := u.BitsToBytes(outBits[o : o+v])
-		outBytes = append(outBytes, output...)
-		o += v
-	}
-	if o != (e.meta)[cNo].OutputSize {
-		panic("o != e.g.Cs[cNo].OutputSize")
-	}
-	return outBytes
-}
-
-func evaluate(c *meta.Circuit, wireLabels *[][]byte, truthTables *[]byte,
-	decodingTable *[]byte) []byte {
+func evaluate(c *meta.Circuit, wireLabels *[][]byte, truthTables *[]byte) []byte {
 	andGateIdx := 0
 	// gate type XOR==0 AND==1 INV==2
 	for i := 0; i < len(c.Gates); i++ {
@@ -99,16 +69,12 @@ func evaluate(c *meta.Circuit, wireLabels *[][]byte, truthTables *[]byte,
 			panic("Unknown gate")
 		}
 	}
-
-	// decode output labels
-	// get decoding table: LSB of label0 for each output wire
+	// return encoded output
 	outLSBs := make([]int, c.OutputSize)
 	for i := 0; i < c.OutputSize; i++ {
 		outLSBs[i] = int((*wireLabels)[c.WireCount-c.OutputSize+i][15]) & 1
 	}
-	encodings := u.BitsToBytes(outLSBs)
-	plaintext := u.XorBytes(*decodingTable, encodings)
-	return plaintext
+	return u.BitsToBytes(outLSBs)
 }
 
 func evaluateAnd(g meta.Gate, wireLabels *[][]byte, truthTables *[]byte, andGateIdx int) {

@@ -25,16 +25,16 @@ type gc struct {
 // Blob is what is returned when gc is read from disk
 type Blob struct {
 	Il *[]byte
-	// we dont return bytes of tt and dt because we gonna be streaming the file
+	// we dont return bytes of tt because we gonna be streaming the file
 	// directly into the HTTP response to save memory
 	TtFile *os.File
-	DtFile *os.File
+	Dt     *[]byte
 }
 
 type GarbledPool struct {
 	// gPDirPath is full path to the garbled pool dir
 	gPDirPath string
-	// AES-GCM keys to encrypt/authenticate circuits' labels.
+	// AES-GCM keys to encrypt/authenticate circuits' blob.
 	// We need to encrypt them in case we want to store them outside the enclave.
 	// When the encryption key changes, older keys are kept because we still
 	// have labels on disk encrypted with old keys.
@@ -55,7 +55,7 @@ type GarbledPool struct {
 	// the amount of c5 circuits will be poolSize*100 because on average one
 	// session needs that many garbled c5 circuits
 	poolSize int
-	// Circuits's count starts from 1
+	// Circuits contains metainfo for each circuit. Circuit count starts from 1
 	Circuits []*meta.Circuit
 	grb      garbler.Garbler
 	// noSandbox is set to true when not running in a sandboxed environment
@@ -112,12 +112,13 @@ func (g *GarbledPool) Init(noSandbox bool) {
 }
 
 // returns 1 garbling of each circuit and c5Count garblings for circuit 5
-func (g *GarbledPool) GetBlobs(c6Count int) []Blob {
+func (g *GarbledPool) GetBlobs(c6Count int) [][]Blob {
 	if c6Count > 1026 {
 		panic("c6Count > 1026")
 	}
-	var allBlobs []Blob
 
+	// we don't use index 0 for clarity, count starts from 1
+	allBlobs := make([][]Blob, len(g.Circuits))
 	// fetch blobs
 	for i := 1; i < len(g.Circuits); i++ {
 		iStr := strconv.Itoa(i)
@@ -140,7 +141,7 @@ func (g *GarbledPool) GetBlobs(c6Count int) []Blob {
 			g.pool[iStr] = g.pool[iStr][1:]
 			g.Unlock()
 			blob := g.fetchBlob(iStr, gc)
-			allBlobs = append(allBlobs, blob)
+			allBlobs[i] = append(allBlobs[i], blob)
 		}
 	}
 	return allBlobs
@@ -244,12 +245,16 @@ func (g *GarbledPool) monitor() {
 
 func (g *GarbledPool) saveBlob(path string, il *[]byte, tt *[]byte, dt *[]byte) {
 	var ilToWrite *[]byte
-	// we only encrypt input labels
+	var dtToWrite *[]byte
+	// we encrypt input labels and decoding table
 	if !g.noSandbox {
 		ilEnc := u.AESGCMencrypt(g.key, *il)
 		ilToWrite = &ilEnc
+		dtEnc := u.AESGCMencrypt(g.key, *dt)
+		dtToWrite = &dtEnc
 	} else {
 		ilToWrite = il
+		dtToWrite = dt
 	}
 	err := os.WriteFile(path+"_il", *ilToWrite, 0644)
 	if err != nil {
@@ -259,13 +264,14 @@ func (g *GarbledPool) saveBlob(path string, il *[]byte, tt *[]byte, dt *[]byte) 
 	if err != nil {
 		panic(err)
 	}
-	err = os.WriteFile(path+"_dt", *dt, 0644)
+	err = os.WriteFile(path+"_dt", *dtToWrite, 0644)
 	if err != nil {
 		panic(err)
 	}
 }
 
-// fetches the blob from disk and deletes it
+// fetches the blob from disk and deletes il and dt. tt will be deleted later
+// by the caller.
 func (g *GarbledPool) fetchBlob(circuitNo string, c gc) Blob {
 	fullPath := filepath.Join(g.gPDirPath, "c"+circuitNo, c.id)
 	il, err := os.ReadFile(fullPath + "_il")
@@ -276,7 +282,16 @@ func (g *GarbledPool) fetchBlob(circuitNo string, c gc) Blob {
 	if err != nil {
 		panic(err)
 	}
-	// only the file handle of truth tables and decoding tables is returned,
+	dt, err2 := os.ReadFile(fullPath + "_dt")
+	if err2 != nil {
+		panic(err2)
+	}
+	err = os.Remove(fullPath + "_dt")
+	if err != nil {
+		panic(err)
+	}
+
+	// only the file handle of truth tables is returned,
 	// so that the file could be streamed (avoiding a full copy into memory)
 	// The session which receives this handle will be responsible for
 	// deleting the file
@@ -284,17 +299,16 @@ func (g *GarbledPool) fetchBlob(circuitNo string, c gc) Blob {
 	if err3 != nil {
 		panic(err3)
 	}
-	dtFile, err4 := os.Open(fullPath + "_dt")
-	if err4 != nil {
-		panic(err4)
-	}
 	var ilToReturn = &il
+	var dtToReturn = &dt
 	if !g.noSandbox {
 		// decrypt data from disk when in a sandbox
 		ilDec := u.AESGCMdecrypt(g.keys[c.keyIdx], il)
 		ilToReturn = &ilDec
+		dtDec := u.AESGCMdecrypt(g.keys[c.keyIdx], dt)
+		dtToReturn = &dtDec
 	}
-	return Blob{ilToReturn, ttFile, dtFile}
+	return Blob{ilToReturn, ttFile, dtToReturn}
 }
 
 // Convert the circuits from the "Bristol fashion" format into a compact

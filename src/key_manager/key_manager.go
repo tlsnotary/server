@@ -21,9 +21,9 @@ import (
 
 type KeyManager struct {
 	sync.Mutex
-	// Blob contains validFrom|validUntil|pubkey|signature
+	// KeyData contains validFrom|validUntil|pubkey|signature
 	// the client will verify the signature (made with the masterKey)
-	Blob []byte
+	KeyData []byte
 	// PrivKey is the ephemeral key used to sign a session. Also used
 	// in ECDH with the the client to derive symmetric keys to encrypt the communication
 	PrivKey *ecdsa.PrivateKey
@@ -38,6 +38,19 @@ type KeyManager struct {
 func (k *KeyManager) Init() {
 	k.generateMasterKey()
 	go k.rotateEphemeralKeys()
+}
+
+// GetActiveKey returns the currently active signing key as well as KeyData
+// associated with it
+func (k *KeyManager) GetActiveKey() (ecdsa.PrivateKey, []byte) {
+	// copying data so that it doesn't change from under us if
+	// ephemeral key happens to change while this session is running
+	k.Lock()
+	keyData := make([]byte, len(k.KeyData))
+	copy(keyData, k.KeyData)
+	key := *k.PrivKey
+	k.Unlock()
+	return key, keyData
 }
 
 // generateMasterKey generates a P-256 master key. The corresponding public key
@@ -94,7 +107,7 @@ func (k *KeyManager) rotateEphemeralKeys() {
 		signature := u.ECDSASign(k.masterKey, validFrom, validUntil, pubkey)
 		blob := u.Concat(validFrom, validUntil, pubkey, signature)
 		k.Lock()
-		k.Blob = blob
+		k.KeyData = blob
 		k.PrivKey = newKey
 		k.Unlock()
 	}

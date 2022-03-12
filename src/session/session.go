@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"io"
 	"log"
-	"math"
 	"math/big"
 	"notary/evaluator"
 	"notary/garbled_pool"
@@ -72,8 +71,8 @@ type Session struct {
 	notaryKey []byte
 	// clientKey is a symmetric key used to decrypt messages FROM the client
 	clientKey []byte
-	// signingKey is an ephemeral key used to sign the notarization session
-	signingKey *ecdsa.PrivateKey
+	// SigningKey is an ephemeral key used to sign the notarization session
+	SigningKey ecdsa.PrivateKey
 	// StorageDir is where the blobs from the client are stored
 	StorageDir string
 	// msgsSeen contains a list of all messages seen from the client
@@ -84,16 +83,21 @@ type Session struct {
 	PmsOuterHashState []byte
 	// MsOuterHashState is the state of the outer hash of HMAC needed to compute the MS
 	MsOuterHashState []byte
-	// Commitment is the hash of plaintext output for each circuit
-	Commitment [][]byte
-	// Salt is used to salt Commitment before sending it to the client
-	Salt [][]byte
+	// hisCommitment is client's salted commitment for each circuit
+	hisCommitment [][]byte
+	// encodedOutput is notary's encoded output for each circuit
+	encodedOutput [][]byte
+	// c6CheckValue is encoded outputs and decoding table which must the sent to
+	// Client as part of dual execution garbling. We store it here until Client
+	// sends her commitment. Then we send it out.
+	c6CheckValue []byte
 	// meta contains information about circuits
 	meta []*meta.Circuit
-	// Tt/Dt are file handles for truth tables/decoding tables which are used
+	// Tt are file handles for truth tables which are used
 	// to stream directly to the HTTP response (saving memory)
-	Dt []*os.File
-	Tt []*os.File
+	Tt [][]*os.File
+	// dt are decoding tables for each execution of each garbled circuit
+	dt [][][]byte
 	// streamCounter is used when client uploads his blob to the notary
 	streamCounter *StreamCounter
 	// Gp is used to access the garbled pool
@@ -108,7 +112,7 @@ type Session struct {
 
 // Init1 is the first message from the client. It starts Oblivious Transfer
 // setup and we also initialize all of Session's structures.
-func (s *Session) Init1(body, blob []byte, signingKey ecdsa.PrivateKey) []byte {
+func (s *Session) Init1(body []byte) []byte {
 	s.sequenceCheck(1)
 	s.g = new(garbler.Garbler)
 	s.e = new(evaluator.Evaluator)
@@ -116,10 +120,9 @@ func (s *Session) Init1(body, blob []byte, signingKey ecdsa.PrivateKey) []byte {
 	s.otR = new(ot.OTReceiver)
 	s.p2pc = new(paillier2pc.Paillier2PC)
 	s.ghash = new(ghash.GHASH)
-	s.signingKey = &signingKey
 	// the first 64 bytes are client pubkey for ECDH
 	o := 0
-	s.clientKey, s.notaryKey = s.getSymmetricKeys(body[o:o+64], &signingKey)
+	s.clientKey, s.notaryKey = s.getSymmetricKeys(body[o:o+64], &s.SigningKey)
 	o += 64
 	c6Count := int(new(big.Int).SetBytes(body[o : o+2]).Uint64())
 	o += 2
@@ -153,26 +156,33 @@ func (s *Session) Init1(body, blob []byte, signingKey ecdsa.PrivateKey) []byte {
 		panic(err)
 	}
 
-	// get already garbled circuits
+	// get already garbled circuits ...
 	blobs := s.Gp.GetBlobs(c6Count)
-	// separate into input labels, truth tables, decoding table
-	il := make([]*[]byte, len(blobs))
-	s.Tt = make([]*os.File, len(blobs))
-	s.Dt = make([]*os.File, len(blobs))
-	for i := 0; i < len(blobs); i++ {
-		il[i] = blobs[i].Il
-		s.Tt[i] = blobs[i].TtFile
-		s.Dt[i] = blobs[i].DtFile
+	// and separate into input labels, truth tables, decoding table
+	il := make([][][]byte, len(s.Gp.Circuits))
+	s.Tt = make([][]*os.File, len(s.Gp.Circuits))
+	s.dt = make([][][]byte, len(s.Gp.Circuits))
+	// depending on the number of circuit executions, there may be more than
+	// one Blob for every circuit
+	for i := 1; i < len(s.Gp.Circuits); i++ {
+		il[i] = make([][]byte, len(blobs[i]))
+		s.Tt[i] = make([]*os.File, len(blobs[i]))
+		s.dt[i] = make([][]byte, len(blobs[i]))
+		for j, blob := range blobs[i] {
+			il[i][j] = *blob.Il
+			s.Tt[i][j] = blob.TtFile
+			s.dt[i][j] = *blob.Dt
+		}
 	}
+
 	s.meta = s.Gp.Circuits
 	s.g.Init(il, s.meta, c6Count)
 	s.e.Init(s.meta, c6Count)
-	s.Salt = make([][]byte, len(s.g.Cs))
-	s.Commitment = make([][]byte, len(s.g.Cs))
+	s.hisCommitment = make([][]byte, len(s.g.Cs))
+	s.encodedOutput = make([][]byte, len(s.g.Cs))
 
 	s.p2pc.Init()
-	return u.Concat(blob, s.encryptToClient(u.Concat(A, seedCommit, allBs,
-		senderSeedShare)))
+	return s.encryptToClient(u.Concat(A, seedCommit, allBs, senderSeedShare))
 }
 
 // continue initialization. Setting up the Oblivious Transfer.
@@ -201,10 +211,18 @@ func (s *Session) Init2(encrypted []byte) []byte {
 	return s.encryptToClient(u.Concat(encryptedColumns, receiverSeedShare, x, t))
 }
 
-// GetBlobChunk returns file handles to truth tables and decoding table
-func (s *Session) GetBlob(encrypted []byte) ([]*os.File, []*os.File) {
+// GetBlob returns file handles to truth tables
+func (s *Session) GetBlob(encrypted []byte) []*os.File {
 	s.sequenceCheck(3)
-	return s.Tt, s.Dt
+	// flatten into one slice
+	var flat []*os.File
+	for _, sliceOfFiles := range s.Tt {
+		if len(sliceOfFiles) == 0 {
+			continue
+		}
+		flat = append(flat, sliceOfFiles...)
+	}
+	return flat
 }
 
 // SetBlobChunk stores a blob from the client.
@@ -224,7 +242,7 @@ func (s *Session) SetBlob(respBody io.ReadCloser) []byte {
 	return nil
 }
 
-func (s *Session) GetUploadProgress() []byte {
+func (s *Session) GetUploadProgress(dummy []byte) []byte {
 	// special case. This message may be repeated many times
 	s.sequenceCheck(100)
 	bytes := make([]byte, 4)
@@ -273,22 +291,18 @@ func (s *Session) C1_step1(encrypted []byte) []byte {
 func (s *Session) C1_step2(encrypted []byte) []byte {
 	s.sequenceCheck(10)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, dtBlob := s.RetrieveBlobsForNotary(1)
-	notaryLabels, clientLabels := s.c_step2(1, body)
-	output := s.e.Evaluate(1, notaryLabels, clientLabels, ttBlob, dtBlob)
-	s.Commitment[1] = u.Sha256(output)
-	s.Salt[1] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[1], s.Salt[1]))
-	// unmask the output
-	s.PmsOuterHashState = u.XorBytes(output[0:32], s.g.Cs[1].Masks[1])
-	return s.encryptToClient(hash)
+	return s.encryptToClient(s.common_step2(1, body))
 }
 
 // [REF 1] Step 4. N computes a1 and passes it to C.
 func (s *Session) C1_step3(encrypted []byte) []byte {
 	s.sequenceCheck(11)
 	body := s.decryptFromClient(encrypted)
-	a1 := u.FinishHash(s.PmsOuterHashState, body)
+	output := s.processDecommit(1, body[:len(body)-32])
+	hisInnerHash := body[len(body)-32:]
+	// unmask the output
+	s.PmsOuterHashState = u.XorBytes(output[0:32], s.g.Cs[1].Masks[1])
+	a1 := u.FinishHash(s.PmsOuterHashState, hisInnerHash)
 	return s.encryptToClient(a1)
 }
 
@@ -321,23 +335,19 @@ func (s *Session) C2_step1(encrypted []byte) []byte {
 func (s *Session) C2_step2(encrypted []byte) []byte {
 	s.sequenceCheck(15)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(2)
-	notaryLabels, clientLabels := s.c_step2(2, body)
-	output := s.e.Evaluate(2, notaryLabels, clientLabels, ttBlob, olBlob)
-	s.Commitment[2] = u.Sha256(output)
-	s.Salt[2] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[2], s.Salt[2]))
-	// unmask the output
-	s.MsOuterHashState = u.XorBytes(output[0:32], s.g.Cs[2].Masks[1])
-	return s.encryptToClient(hash)
+	return s.encryptToClient(s.common_step2(2, body))
+
 }
 
 // [REF 1] Step 14 and Step 21. N computes a1 and a1 and sends it to C.
 func (s *Session) C2_step3(encrypted []byte) []byte {
 	s.sequenceCheck(16)
 	body := s.decryptFromClient(encrypted)
-	a1inner := body[:32]
-	a1inner_vd := body[32:64]
+	output := s.processDecommit(2, body[:len(body)-64])
+	a1inner := body[len(body)-64 : len(body)-32]
+	a1inner_vd := body[len(body)-32:]
+	// unmask the output
+	s.MsOuterHashState = u.XorBytes(output[0:32], s.g.Cs[2].Masks[1])
 	a1 := u.FinishHash(s.MsOuterHashState, a1inner)
 	a1_vd := u.FinishHash(s.MsOuterHashState, a1inner_vd)
 	return s.encryptToClient(u.Concat(a1, a1_vd))
@@ -380,21 +390,20 @@ func (s *Session) C3_step1(encrypted []byte) []byte {
 func (s *Session) C3_step2(encrypted []byte) []byte {
 	s.sequenceCheck(19)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(3)
-	notaryLabels, clientLabels := s.c_step2(3, body)
-	output := s.e.Evaluate(3, notaryLabels, clientLabels, ttBlob, olBlob)
-	// notary doesn't need to parse the output of the circuit, since we
-	// already know what out TLS key shares are
-	s.Commitment[3] = u.Sha256(output)
-	s.Salt[3] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[3], s.Salt[3]))
-	return s.encryptToClient(hash)
+	return s.encryptToClient(s.common_step2(3, body))
 }
 
 // [REF 1] Step 18.
 func (s *Session) C4_step1(encrypted []byte) []byte {
 	s.sequenceCheck(20)
 	body := s.decryptFromClient(encrypted)
+	// to save a round-trip, circuit 3 piggy-backs on this message to parse the
+	// decommitment. Notary doesn't need to parse the output of the circuit,
+	// since we already know what out TLS key shares are
+	decommitSize := len(s.encodedOutput[3]) + len(u.Concat(s.dt[3]...)) + 32
+	s.processDecommit(3, body[:decommitSize])
+
+	body = body[decommitSize:]
 	g := s.g
 	s.setCircuitInputs(4,
 		s.swkShare,
@@ -404,14 +413,14 @@ func (s *Session) C4_step1(encrypted []byte) []byte {
 		g.Cs[4].Masks[1],
 		g.Cs[4].Masks[2])
 
-	hisOtReq := s.c_step1A(4, body)
+	hisOtReq := body
 	// instead of the usual c_step1B, we have a special case
-	otResp, encryptedLabels := s.c4_step1B(hisOtReq)
-	out := s.c_step1C(4, otResp)
+	otResp, encryptedLabels := s.c4_step1A(hisOtReq)
+	out := s.c_step1B(4, otResp)
 	return s.encryptToClient(u.Concat(out, encryptedLabels))
 }
 
-func (s *Session) c4_step1B(hisOtReq []byte) ([]byte, []byte) {
+func (s *Session) c4_step1A(hisOtReq []byte) ([]byte, []byte) {
 	// We need to make sure that the same input labels which we give
 	// to the client for c4's client_write_key (cwk) and client_write_iv
 	// (civ) will also be given for all invocations of circuit 6. This ensures
@@ -492,20 +501,11 @@ func (s *Session) c4_step1B(hisOtReq []byte) ([]byte, []byte) {
 	return newOtResp, encryptedLabels
 }
 
-// [REF 1] Step 18. Notary doesn't need to parse the circuit's output because
-// the masks that he inputted become his TLS keys' shares.
+// [REF 1] Step 18.
 func (s *Session) C4_step2(encrypted []byte) []byte {
 	s.sequenceCheck(21)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(4)
-	notaryLabels, clientLabels := s.c_step2(4, body)
-	output := s.e.Evaluate(4, notaryLabels, clientLabels, ttBlob, olBlob)
-	// notary doesn't need to parse the output of the circuit, since we
-	// already know what out TLS key shares are
-	s.Commitment[4] = u.Sha256(output)
-	s.Salt[4] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[4], s.Salt[4]))
-	return s.encryptToClient(hash)
+	return s.encryptToClient(s.common_step2(4, body))
 }
 
 // compute MAC for Client_Finished using Oblivious Transfer
@@ -514,9 +514,11 @@ func (s *Session) C4_step2(encrypted []byte) []byte {
 func (s *Session) C4_step3(encrypted []byte) []byte {
 	s.sequenceCheck(22)
 	body := s.decryptFromClient(encrypted)
+	// Notary doesn't need to parse circuit's 4 output because
+	// the masks that he inputted become his TLS keys' shares.
+	s.processDecommit(4, body[:len(body)-(16+33)])
+	body = body[len(body)-(16+33):]
 	g := s.g
-	u.Assert(len(body) == 16+33)
-
 	o := 0
 	encCF := body[o : o+16]
 	o += 16
@@ -578,14 +580,13 @@ func (s *Session) C5_pre1(encrypted []byte) []byte {
 func (s *Session) C5_step1(encrypted []byte) []byte {
 	s.sequenceCheck(24)
 	body := s.decryptFromClient(encrypted)
-	g := s.g
 	s.setCircuitInputs(5,
 		s.MsOuterHashState,
 		s.swkShare,
 		s.sivShare,
-		g.Cs[5].Masks[1],
-		g.Cs[5].Masks[2])
-	u.Assert(len(g.Cs[5].InputBits)/8 == 84)
+		s.g.Cs[5].Masks[1],
+		s.g.Cs[5].Masks[2])
+	u.Assert(len(s.g.Cs[5].InputBits)/8 == 84)
 	out := s.c_step1(5, body)
 	return s.encryptToClient(out)
 }
@@ -594,13 +595,7 @@ func (s *Session) C5_step1(encrypted []byte) []byte {
 func (s *Session) C5_step2(encrypted []byte) []byte {
 	s.sequenceCheck(25)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(5)
-	notaryLabels, clientLabels := s.c_step2(5, body)
-	output := s.e.Evaluate(5, notaryLabels, clientLabels, ttBlob, olBlob)
-	s.Commitment[5] = u.Sha256(output)
-	s.Salt[5] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[5], s.Salt[5]))
-	return s.encryptToClient(hash)
+	return s.encryptToClient(s.common_step2(5, body))
 }
 
 // compute MAC for Server_Finished using Oblivious Transfer
@@ -608,9 +603,9 @@ func (s *Session) C5_step2(encrypted []byte) []byte {
 func (s *Session) C5_step3(encrypted []byte) []byte {
 	s.sequenceCheck(26)
 	body := s.decryptFromClient(encrypted)
+	s.processDecommit(5, body[:len(body)-(16+33)])
+	body = body[len(body)-(16+33):]
 	g := s.g
-	u.Assert(len(body) == 16+33)
-
 	o := 0
 	encSF := body[o : o+16]
 	o += 16
@@ -657,7 +652,7 @@ func (s *Session) C6_step1(encrypted []byte) []byte {
 	}
 	s.setCircuitInputs(6, allInputs...)
 
-	hisOtReq := s.c_step1A(6, body)
+	hisOtReq := body
 	// ---------------------------------------
 	// instead of the usual c_step1B, we have a special case:
 	// we need to remove all the labels corresponding to client_write_key
@@ -674,25 +669,34 @@ func (s *Session) C6_step1(encrypted []byte) []byte {
 	// proceed with the regular step1 flow
 	// ---------------------------------------
 	otResp := s.otS.ProcessRequest(hisOtReq, labels)
-	out := s.c_step1C(6, otResp)
+	out := s.c_step1B(6, otResp)
 	return s.encryptToClient(out)
 }
 
-func (s *Session) C6_step2(encrypted []byte) []byte {
+func (s *Session) C6_pre2(encrypted []byte) []byte {
 	s.sequenceCheck(28)
 	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(6)
-	notaryLabels, clientLabels := s.c_step2(6, body)
-	output := s.e.Evaluate(6, notaryLabels, clientLabels, ttBlob, olBlob)
-	s.Commitment[6] = u.Sha256(output)
-	s.Salt[6] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[6], s.Salt[6]))
-	return s.encryptToClient(hash)
+	// add a dummy 32-byte commitment to keep common_step2() happy
+	body = append(body, make([]byte, 32)...)
+	s.c6CheckValue = s.common_step2(6, body)
+	// do not send c6CheckValue until Client sends his commitment
+	return nil
+}
+
+func (s *Session) C6_step2(encrypted []byte) []byte {
+	s.sequenceCheck(29)
+	body := s.decryptFromClient(encrypted)
+	u.Assert(len(body) == 32)
+	s.hisCommitment[6] = body
+	return s.encryptToClient(s.c6CheckValue)
 }
 
 func (s *Session) C7_step1(encrypted []byte) []byte {
-	s.sequenceCheck(29)
+	s.sequenceCheck(30)
 	body := s.decryptFromClient(encrypted)
+	decommitSize := len(s.encodedOutput[6]) + len(u.Concat(s.dt[6]...)) + 32
+	s.processDecommit(6, body[:decommitSize])
+	body = body[decommitSize:]
 	g := s.g
 	var allInputs [][]byte
 	allInputs = append(allInputs, s.cwkShare)
@@ -706,32 +710,18 @@ func (s *Session) C7_step1(encrypted []byte) []byte {
 }
 
 func (s *Session) C7_step2(encrypted []byte) []byte {
-	s.sequenceCheck(30)
-	body := s.decryptFromClient(encrypted)
-	ttBlob, olBlob := s.RetrieveBlobsForNotary(7)
-	notaryLabels, clientLabels := s.c_step2(7, body)
-	output := s.e.Evaluate(7, notaryLabels, clientLabels, ttBlob, olBlob)
-	s.Commitment[7] = u.Sha256(output)
-	s.Salt[7] = u.GetRandom(32)
-	hash := u.Sha256(u.Concat(s.Commitment[7], s.Salt[7]))
-	return s.encryptToClient(hash)
-}
-
-// one extra communication round trip to check the hash
-func (s *Session) CheckC7Commit(encrypted []byte) []byte {
 	s.sequenceCheck(31)
 	body := s.decryptFromClient(encrypted)
-	hisCommit := body
-	if !bytes.Equal(hisCommit, s.Commitment[7]) {
-		panic("commit hash doesn't match")
-	}
-	return s.encryptToClient(s.Salt[7])
+	return s.encryptToClient(s.common_step2(7, body))
 }
 
 // compute MAC for client's request using Oblivious Transfer
 func (s *Session) Ghash_step1(encrypted []byte) []byte {
 	s.sequenceCheck(32)
 	body := s.decryptFromClient(encrypted)
+	decommitSize := len(s.encodedOutput[7]) + len(u.Concat(s.dt[7]...)) + 32
+	s.processDecommit(7, body[:decommitSize])
+	body = body[decommitSize:]
 	o := 0
 	mpnBytes := body[o : o+2]
 	o += 2
@@ -814,7 +804,7 @@ func (s *Session) CommitHash(encrypted []byte) []byte {
 	hisPMSShareHash := body[64:96]
 	timeBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(timeBytes, uint64(time.Now().Unix()))
-	signature := u.ECDSASign(s.signingKey,
+	signature := u.ECDSASign(&s.SigningKey,
 		hisCommitHash,
 		hisKeyShareHash,
 		hisPMSShareHash,
@@ -895,75 +885,51 @@ func (s *Session) sequenceCheck(seqNo int) {
 	s.msgsSeen = append(s.msgsSeen, seqNo)
 }
 
-// returns truth tables and decoding tables for the circuit number cNo from the
+// returns truth tables for the circuit number cNo from the
 // blob which we received earlier from the client
-func (s *Session) RetrieveBlobsForNotary(cNo int) ([]byte, []byte) {
-	off, ttSize, dtSize := s.getCircuitBlobOffset(cNo)
+func (s *Session) RetrieveBlobsForNotary(cNo int) []byte {
+	off, ttSize := s.getCircuitBlobOffset(cNo)
 	path := filepath.Join(s.StorageDir, "blobForNotary")
 	file, err := os.Open(path)
 	if err != nil {
 		panic(err)
 	}
-	buffer := make([]byte, ttSize+dtSize)
+	buffer := make([]byte, ttSize)
 	_, err = file.ReadAt(buffer, int64(off))
 	if err != nil && err != io.EOF {
 		panic(err)
 	}
 	tt := buffer[:ttSize]
-	dt := buffer[ttSize:]
-	return tt, dt
+	return tt
 }
 
 // GetCircuitBlobOffset finds the offset and size of the tt+dt blob for circuit cNo
 // in the blob of all circuits
-func (s *Session) getCircuitBlobOffset(cNo int) (int, int, int) {
+func (s *Session) getCircuitBlobOffset(cNo int) (int, int) {
 	offset := 0
 	ttLen := 0
-	dtLen := 0
 	for i := 1; i < len(s.g.Cs); i++ {
-		offset += ttLen + dtLen
+		offset += ttLen
 		ttLen = s.g.Cs[i].Meta.AndGateCount * 48
-		dtLen = int(math.Ceil(float64(s.g.Cs[i].Meta.OutputSize) / 8))
 		if i == 6 {
 			ttLen = s.g.C6Count * ttLen
-			dtLen = s.g.C6Count * dtLen
 		}
 		if i == cNo {
 			break
 		}
 	}
-	return offset, ttLen, dtLen
+	return offset, ttLen
 }
 
-func (s *Session) c_step1A(cNo int, body []byte) []byte {
-	o := 0
-	// check client's commitment to the previous circuit's output
-	if cNo > 1 {
-		hisCommit := body[:32]
-		o += 32
-		if !bytes.Equal(hisCommit, s.Commitment[cNo-1]) {
-			panic("commitments don't match")
-		}
-	}
-	hisOtReq := body[o:]
-	return hisOtReq
-}
-
-func (s *Session) c_step1B(cNo int, hisOtReq []byte) []byte {
+func (s *Session) c_step1A(cNo int, hisOtReq []byte) []byte {
 	otResp := s.otS.ProcessRequest(hisOtReq, s.g.GetClientLabels(cNo))
 	return otResp
 }
 
-func (s *Session) c_step1C(cNo int, otResp []byte) []byte {
+func (s *Session) c_step1B(cNo int, otResp []byte) []byte {
 	inputLabels := s.g.GetNotaryLabels(cNo)
 	myOtReq := s.otR.CreateRequest(s.g.Cs[cNo].InputBits)
-	// send salt for the previous circuit's commitment
-	var salt []byte = nil
-	if cNo > 1 {
-		salt = s.Salt[cNo-1]
-	}
 	return u.Concat(
-		salt,
 		inputLabels,
 		otResp,
 		myOtReq)
@@ -971,13 +937,12 @@ func (s *Session) c_step1C(cNo int, otResp []byte) []byte {
 
 // c_step1 is common for all circuits
 func (s *Session) c_step1(cNo int, body []byte) []byte {
-	hisOtReq := s.c_step1A(cNo, body)
+	hisOtReq := body
 	// because of the dual execution, both client and notary need to
 	// receive their input labels via OT.
 	// we process client's OT request and create a notary's OT request.
-	otResp := s.c_step1B(cNo, hisOtReq)
-	out := s.c_step1C(cNo, otResp)
-	return out
+	otResp := s.c_step1A(cNo, hisOtReq)
+	return s.c_step1B(cNo, otResp)
 }
 
 // given a slice of circuit inputs in the same order as expected by the c*.casm file,
@@ -988,15 +953,93 @@ func (s *Session) setCircuitInputs(cNo int, inputs ...[]byte) {
 	}
 }
 
-// c_step2 is common for all circuits. Returns notary's and client's input
+// common_step2 is Step2 which is the same for all circuits. Returns a value
+// which must be sent to the Client as part of dual execution garbling.
+func (s *Session) common_step2(cNo int, body []byte) []byte {
+	ttBlob := s.RetrieveBlobsForNotary(cNo)
+	notaryLabels, clientLabels, clientCommitment := s.parse_step2(cNo, body)
+	s.hisCommitment[cNo] = clientCommitment
+	s.encodedOutput[cNo] = s.e.Evaluate(cNo, notaryLabels, clientLabels, ttBlob)
+	return u.Concat(s.encodedOutput[cNo], u.Concat(s.dt[cNo]...))
+}
+
+// parse_step2 is common for all circuits. Returns notary's and client's input
 // labels for the circuit number cNo.
-// Notary is acting as the evaluator. Client sent its input labels in the clear
-// and also sent notary's input labels via OT.
-func (s *Session) c_step2(cNo int, body []byte) ([]byte, []byte) {
+// Notary is acting as the evaluator. Client sent his input labels in the clear
+// and he also sent notary's input labels via OT.
+func (s *Session) parse_step2(cNo int, body []byte) ([]byte, []byte, []byte) {
+	o := 0
 	// exeCount is how many executions of this circuit we need
 	exeCount := []int{0, 1, 1, 1, 1, 1, s.g.C6Count, 1}[cNo]
-	otResp := body[:s.g.Cs[cNo].Meta.NotaryInputSize*32*exeCount]
-	clientLabels := body[s.g.Cs[cNo].Meta.NotaryInputSize*32*exeCount:]
+	allNotaryOtSize := s.g.Cs[cNo].Meta.NotaryInputSize * 32 * exeCount
+	otResp := body[o : o+allNotaryOtSize]
+	o += allNotaryOtSize
+	allClientLabelsSize := s.g.Cs[cNo].Meta.ClientInputSize * 16 * exeCount
+	clientLabels := body[o : o+allClientLabelsSize]
+	o += allClientLabelsSize
+	clientCommitment := body[o : o+32]
+	o += 32
+	u.Assert(o == len(body))
 	notaryLabels := s.otR.ParseResponse(s.g.Cs[cNo].InputBits, otResp)
-	return notaryLabels, clientLabels
+	return notaryLabels, clientLabels, clientCommitment
+}
+
+// processDecommit processes Client's decommitment, makes sure it matches the
+// commitment, decodes and parses the Notary's circuit output.
+// Client committed first, then Notary revealed his encoded outputs and
+// decoding table and now the Client decommits.
+func (s *Session) processDecommit(cNo int, decommit []byte) []byte {
+	o := 0
+	hisEncodedOutput := decommit[o : o+len(s.encodedOutput[cNo])]
+	o += len(s.encodedOutput[cNo])
+	myDecodingTable := u.Concat(s.dt[cNo]...)
+	hisDecodingTable := decommit[o : o+len(myDecodingTable)]
+	o += len(myDecodingTable)
+	hisSalt := decommit[o : o+32]
+	o += 32
+	u.Assert(o == len(decommit))
+	u.Assert(bytes.Equal(s.hisCommitment[cNo], u.Sha256(u.Concat(
+		hisEncodedOutput, hisDecodingTable, hisSalt))))
+	// decode his output, my output and compare them
+	hisPlaintext := u.XorBytes(myDecodingTable, hisEncodedOutput)
+	myPlaintext := u.XorBytes(hisDecodingTable, s.encodedOutput[cNo])
+	u.Assert(bytes.Equal(hisPlaintext, myPlaintext))
+	output := s.parsePlaintextOutput(cNo, myPlaintext)
+	return output
+}
+
+// parsePlaintextOutput parses the plaintext of each circuit execution into
+// output bit and converts the output bits into a flat slice of bytes so that
+// output values are in the same order as they appear in the *.casm files
+func (s *Session) parsePlaintextOutput(cNo int, ptBytes []byte) []byte {
+	c := (s.meta)[cNo]
+	exeCount := []int{0, 1, 1, 1, 1, 1, s.g.C6Count, 1}[cNo]
+	chunks := u.SplitIntoChunks(ptBytes, len(ptBytes)/exeCount)
+	var output []byte
+	for i := 0; i < exeCount; i++ {
+		// plaintext has a padding in MSB to make it a multiple of 8 bits. We
+		// decompose into bits and drop the padding
+		outBits := u.BytesToBits(chunks[i])[0:c.OutputSize]
+		// reverse output bits so that the values of the output be placed in
+		// the same order as they appear in the *.casm files
+		outBytes := s.parseOutputBits(cNo, outBits)
+		output = append(output, outBytes...)
+	}
+	return output
+}
+
+// parseOutputBits converts the output bits of the circuit into a flat slice
+// of bytes so that output values are in the same order as they appear in the *.casm files
+func (s *Session) parseOutputBits(cNo int, outBits []int) []byte {
+	o := 0 // offset
+	var outBytes []byte
+	for _, v := range (s.meta)[cNo].OutputsSizes {
+		output := u.BitsToBytes(outBits[o : o+v])
+		outBytes = append(outBytes, output...)
+		o += v
+	}
+	if o != (s.meta)[cNo].OutputSize {
+		panic("o != e.g.Cs[cNo].OutputSize")
+	}
+	return outBytes
 }
