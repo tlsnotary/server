@@ -142,6 +142,7 @@ func (sm *SessionManager) removeSession(key string) {
 	s, ok := sm.sessions[key]
 	if !ok {
 		log.Println("Cannot remove: session does not exist ", key)
+		return
 	}
 	err := os.RemoveAll(s.session.StorageDir)
 	if err != nil {

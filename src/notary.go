@@ -120,6 +120,12 @@ func setBlob(w http.ResponseWriter, req *http.Request) {
 	writeResponse(out, w)
 }
 
+// ping is sent to check if notary is available
+func ping(w http.ResponseWriter, req *http.Request) {
+	log.Println("in ping", req.RemoteAddr)
+	writeResponse(nil, w)
+}
+
 // when notary starts we expect the admin to upload a URLFetcher document
 // it can be uploaded e.g. with:
 // curl --data-binary '@URLFetcherDoc' 127.0.0.1:10012/setURLFetcherDoc
@@ -200,6 +206,7 @@ func main() {
 
 	http.HandleFunc("/getBlob", getBlob)
 	http.HandleFunc("/setBlob", setBlob)
+	http.HandleFunc("/ping", ping)
 
 	// all the other request will end up in the httpHandler
 	http.HandleFunc("/", httpHandler)
