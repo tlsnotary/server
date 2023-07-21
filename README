@@ -1,3 +1,15 @@
+# Deprecation notice
+
+This notary server implementation was meant to interact with the PageSigner client.
+PageSigner used an old TLSNotary protocol which is unaudited, experimental, and deprecated. 
+A vulnerability was discovered in PageSigner on 19th Jul 2023 allowing the prover to create arbitrary proofs, thus the proofs created with PageSigner must not be trusted.
+
+This repository will not receive any updates and is archived for historical purposes.
+
+------------------------------------------------------------------------------------
+
+
+
 This is the notary server for the TLSNotary protocol.
 
 It is primarily intended to be run inside a sandboxed AWS EC2 instance (https://github.com/tlsnotary/pagesigner-oracles). It can also be run as a regular server (you'll have to start it with --no-sandbox and pass the file public.key to the client).
